@@ -1668,7 +1668,7 @@ static void PacketReceived(PacketCommandNG *packet) {
         case CMD_HF_MIFARE_READBL: {
             mf_readblock_t *payload = (mf_readblock_t *)packet->data.asBytes;
             uint8_t outbuf[16];
-            int16_t retval = mifare_cmd_readblocks(MF_WAKE_WUPA, MIFARE_AUTH_KEYA + (payload->keytype & 1), payload->key, ISO14443A_CMD_READBLOCK, payload->blockno, 1, outbuf);
+            int16_t retval = mifare_cmd_readblocks(MF_WAKE_WUPA, MIFARE_AUTH_KEYA + payload->keytype, payload->key, ISO14443A_CMD_READBLOCK, payload->blockno, 1, outbuf);
             reply_ng(CMD_HF_MIFARE_READBL, retval, outbuf, sizeof(outbuf));
             break;
         }
@@ -1716,7 +1716,7 @@ static void PacketReceived(PacketCommandNG *packet) {
             uint8_t *key = packet->data.asBytes;
             uint8_t *block_data = packet->data.asBytes + 10;
 
-            int16_t retval = mifare_cmd_writeblocks(MF_WAKE_WUPA, MIFARE_AUTH_KEYA + (key_type & 1), key, ISO14443A_CMD_WRITEBLOCK, block_no, 1, block_data);
+            int16_t retval = mifare_cmd_writeblocks(MF_WAKE_WUPA, MIFARE_AUTH_KEYA + (key_type & 0xF), key, ISO14443A_CMD_WRITEBLOCK, block_no, 1, block_data);
 
             // convert ng style retval to old status
             if (retval >= 0) {
@@ -1977,10 +1977,20 @@ static void PacketReceived(PacketCommandNG *packet) {
                 uint8_t block_no;
                 uint8_t key_type;
                 uint8_t key[6];
+                uint8_t block_no_nested;
+                uint8_t key_type_nested;
+                uint8_t key_nested[6];
+                uint8_t nr_nonces;
+                uint8_t resets;
+                uint8_t addread;
+                uint8_t addauth;
+                uint8_t incblk2;
+                uint8_t corruptnrar;
+                uint8_t corruptnrarparity;
             } PACKED;
             struct p *payload = (struct p *) packet->data.asBytes;
 
-            MifareHasStaticEncryptedNonce(payload->block_no, payload->key_type, payload->key);
+            MifareHasStaticEncryptedNonce(payload->block_no, payload->key_type, payload->key, payload->block_no_nested, payload->key_type_nested, payload->key_nested, payload->nr_nonces, payload->resets & 1, (payload->resets >> 1) & 1, payload->addread, payload->addauth, payload->incblk2, payload->corruptnrar, payload->corruptnrarparity);
             break;
         }
 #endif
