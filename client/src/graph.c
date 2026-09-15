@@ -221,7 +221,7 @@ void convertGraphFromBitstreamEx(int hi, int low) {
 
     uint8_t *bits = calloc(g_GraphTraceLen, sizeof(uint8_t));
     if (bits == NULL) {
-        PrintAndLogEx(DEBUG, "ERR: convertGraphFromBitstreamEx, failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return;
     }
 
@@ -470,16 +470,21 @@ bool fskClocks(uint8_t *fc1, uint8_t *fc2, uint8_t *rf1, int *firstClockEdge) {
 
 void add_temporary_marker(uint32_t position, const char *label) {
     if (g_TempMarkerSize == 0) { //Initialize the marker array
-        g_TempMarkers = (marker_t *)calloc(1, sizeof(marker_t));
-    } else { //add more space to the marker array using realloc()
-        marker_t *temp = (marker_t *)realloc(g_TempMarkers, ((g_TempMarkerSize + 1) * sizeof(marker_t)));
 
+        g_TempMarkers = (marker_t *)calloc(1, sizeof(marker_t));
+        if (g_TempMarkers == NULL) { // Unable to allocate memory for the marker array
+            PrintAndLogEx(WARNING, "Failed to allocate memory");
+            return;
+        }
+
+    } else { //add more space to the marker array using realloc()
+
+        marker_t *temp = (marker_t *)realloc(g_TempMarkers, ((g_TempMarkerSize + 1) * sizeof(marker_t)));
         if (temp == NULL) { //Unable to reallocate memory for a new marker
-            PrintAndLogEx(FAILED, "Unable to allocate memory for a new temporary marker!");
+            PrintAndLogEx(WARNING, "Failed to allocate memory");
             free(temp);
             return;
         } else {
-            //Set g_TempMarkers to the new pointer
             g_TempMarkers = temp;
         }
     }
@@ -487,6 +492,10 @@ void add_temporary_marker(uint32_t position, const char *label) {
     g_TempMarkers[g_TempMarkerSize].pos = position;
 
     char *markerLabel = (char *)calloc(1, strlen(label) + 1);
+    if (markerLabel == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return;
+    }
     strcpy(markerLabel, label);
 
     if (strlen(markerLabel) > 30) {
@@ -512,6 +521,11 @@ void remove_temporary_markers(void) {
 buffer_savestate_t save_buffer32(uint32_t *src, size_t length) {
     //calloc the memory needed
     uint32_t *savedBuffer = (uint32_t *)calloc(length, sizeof(uint32_t));
+    if (savedBuffer == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        buffer_savestate_t bst = {0};
+        return bst;
+    }
 
     //Make a copy of the source buffer
     memcpy(savedBuffer, src, (length * sizeof(uint32_t)));
@@ -529,6 +543,11 @@ buffer_savestate_t save_buffer32(uint32_t *src, size_t length) {
 buffer_savestate_t save_bufferS32(int32_t *src, size_t length) {
     //calloc the memory needed
     uint32_t *savedBuffer = (uint32_t *)calloc(length, (sizeof(uint32_t)));
+    if (savedBuffer == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        buffer_savestate_t bst = {0};
+        return bst;
+    }
 
     //Make a copy of the source buffer
     memcpy(savedBuffer, src, (length * sizeof(uint32_t)));
@@ -558,6 +577,11 @@ buffer_savestate_t save_buffer8(uint8_t *src, size_t length) {
 
     // calloc the memory needed
     uint32_t *savedBuffer = (uint32_t *)calloc(buffSize, sizeof(uint32_t));
+    if (savedBuffer == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        buffer_savestate_t bst = {0};
+        return bst;
+    }
     size_t index = 0;
 
     // Pack the source array into the backing array
@@ -623,4 +647,22 @@ size_t restore_buffer8(buffer_savestate_t saveState, uint8_t *dest) {
     }
 
     return index;
+}
+
+// Save/restore the graph buffer as a unit: contents, length and grid offset.
+// A caller that drops restore_bufferS32()'s return leaves g_GraphTraceLen short.
+buffer_savestate_t save_graphbuffer(void) {
+    buffer_savestate_t saveState = save_bufferS32(g_GraphBuffer, g_GraphTraceLen);
+    saveState.offset = g_GridOffset;
+    return saveState;
+}
+
+void restore_graphbuffer(buffer_savestate_t saveState) {
+    size_t len = restore_bufferS32(saveState, g_GraphBuffer);
+    if (len == 0) {
+        // nothing was restored, so leave the buffer and its length alone
+        return;
+    }
+    g_GraphTraceLen = len;
+    g_GridOffset = saveState.offset;
 }

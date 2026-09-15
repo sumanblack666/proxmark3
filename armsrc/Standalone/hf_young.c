@@ -21,10 +21,11 @@
 #include <inttypes.h>
 #include "proxmark3_arm.h"
 #include "appmain.h"
-#include "fpgaloader.h"
+#include "fpga_apis.h"
+#include "fpga_loader.h"
 #include "util.h"
 #include "dbprint.h"
-#include "ticks.h"
+#include "ticks_apis.h"
 #include "string.h"
 #include "commonutil.h"
 #include "mifarecmd.h"
@@ -55,7 +56,7 @@ void RunMod(void) {
 
     card_clone_t uids[OPTS];
     iso14a_card_select_t card[OPTS];
-    uint8_t params = (MAGIC_SINGLE | MAGIC_DATAIN);
+    uint8_t params = (MAGIC_SINGLE | MAGIC_WUPC | MAGIC_DATAIN);
 
     LED(selected + 1, 0);
 
@@ -96,7 +97,7 @@ void RunMod(void) {
                     }
                 }
 
-                if (!iso14443a_select_card(NULL, &card[selected], NULL, true, 0, true)) {
+                if (iso14443a_select_card(NULL, &card[selected], NULL, true, 0, true) == 0) {
                     FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
                     LED_D_OFF();
                     SpinDelay(500);
@@ -162,10 +163,11 @@ void RunMod(void) {
             SpinDelay(500);
             // Begin clone function here:
             /* Example from client/mifarehost.c for commanding a block write for "magic Chinese" cards:
-                    SendCommandMIX(CMD_HF_MIFARE_CSETBL, params & (0xFE | (uid == NULL ? 0:1)), blockNo, 0, data, 16);
+                    SendCommandNG(CMD_HF_MIFARE_CSETBL, payload, sizeof(mf_chinese_blk_t) + 16);
+                    where payload is mf_chinese_blk_t { u8 params, u8 blockno, u8 data[] }
 
                 Block read is similar:
-                    SendCommandMIX(CMD_HF_MIFARE_CGETBL, params, blockNo, 0,...};
+                    SendCommandNG(CMD_HF_MIFARE_CGETBL, payload, sizeof(mf_chinese_blk_t));
                 We need to imitate that call with blockNo 0 to set a uid.
 
                 The get and set commands are handled in this file:
@@ -177,14 +179,14 @@ void RunMod(void) {
                             MifareCGetBlock(c->arg[0], c->arg[1], c->d.asBytes);
                             break;
 
-                mfCSetUID provides example logic for UID set workflow:
+                mf_chinese_set_uid provides example logic for UID set workflow:
                     -Read block0 from card in field with MifareCGetBlock()
                     -Configure new values without replacing reserved bytes
                             memcpy(block0, uid, 4); // Copy UID bytes from byte array
                             // Mifare UID BCC
                             block0[4] = block0[0]^block0[1]^block0[2]^block0[3]; // BCC on byte 5
                             Bytes 5-7 are reserved SAK and ATQA for mifare classic
-                    -Use mfCSetBlock(0, block0, oldUID, wantWipe, MAGIC_SINGLE) to write it
+                    -Use mf_chinese_set_block(0, block0, oldUID, wantWipe, MAGIC_SINGLE | MAGIC_WUPC) to write it
             */
             uint8_t oldBlock0[16] = {0}, newBlock0[16] = {0};
             // arg0 = Flags, arg1=blockNo
@@ -236,7 +238,8 @@ void RunMod(void) {
                 int button_pressed = BUTTON_HELD(1000);
                 if (button_pressed == BUTTON_NO_CLICK) {  // No button action, proceed with sim
 
-                    uint16_t flags = FLAG_4B_UID_IN_DATA;
+                    uint16_t flags = 0;
+                    FLAG_SET_UID_IN_DATA(flags, 4);
                     uint8_t data[PM3_CMD_DATA_SIZE] = {0}; // in case there is a read command received we shouldn't break
 
                     memcpy(data, uids[selected].uid, uids[selected].uidlen);
@@ -244,7 +247,7 @@ void RunMod(void) {
                     uint64_t tmpuid = bytes_to_num(uids[selected].uid, uids[selected].uidlen);
 
                     if (uids[selected].uidlen == 7) {
-                        flags = FLAG_7B_UID_IN_DATA;
+                        FLAG_SET_UID_IN_DATA(flags, 7);
                         Dbprintf("Simulating ISO14443a tag with uid: %014" PRIx64 " [Bank: %d]", tmpuid, selected);
                     } else {
                         Dbprintf("Simulating ISO14443a tag with uid: %08" PRIx64 " [Bank: %d]", tmpuid, selected);

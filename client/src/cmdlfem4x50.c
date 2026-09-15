@@ -163,26 +163,38 @@ static int em4x50_load_file(const char *filename, uint8_t *data, size_t data_len
     return PM3_SUCCESS;
 }
 
-static void em4x50_seteml(uint8_t *src, uint32_t offset, uint32_t numofbytes) {
+static int em4x50_seteml(const uint8_t *src, uint32_t offset, uint32_t numofbytes) {
+
+    // an EM4x50 is 136 bytes, so the whole tag always fits in a single frame
+    if ((offset + numofbytes) > (g_conn.max_cmd_data_size - sizeof(em4x50_eset_t))) {
+        PrintAndLogEx(FAILED, "%u bytes at offset %u doesn't fit in one frame", numofbytes, offset);
+        return PM3_EOUTOFBOUND;
+    }
 
     PrintAndLogEx(INFO, "uploading to emulator memory");
-    PrintAndLogEx(INFO, "." NOLF);
-    // fast push mode
-    g_conn.block_after_ACK = true;
-    for (size_t i = offset; i < numofbytes; i += PM3_CMD_DATA_SIZE_MIX) {
 
-        size_t len = MIN((numofbytes - i), PM3_CMD_DATA_SIZE_MIX);
-        if (len == numofbytes - i) {
-            // Disable fast mode on last packet
-            g_conn.block_after_ACK = false;
-        }
-        clearCommandBuffer();
-        SendCommandMIX(CMD_LF_EM4X50_ESET, i, len, 0, src + i, len);
-        PrintAndLogEx(NORMAL, "." NOLF);
-        fflush(stdout);
+    uint8_t buf[PM3_CMD_DATA_SIZE] = {0};
+    em4x50_eset_t *payload = (em4x50_eset_t *)buf;
+    payload->offset = offset;
+    payload->len = numofbytes;
+    memcpy(payload->data, src + offset, numofbytes);
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_LF_EM4X50_ESET, buf, sizeof(em4x50_eset_t) + numofbytes);
+
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_LF_EM4X50_ESET, &resp, 2000) == false) {
+        PrintAndLogEx(WARNING, "timeout while waiting for reply");
+        return PM3_ETIMEOUT;
     }
-    PrintAndLogEx(NORMAL, "");
-    PrintAndLogEx(SUCCESS, "uploaded " _YELLOW_("%d") " bytes to emulator memory", numofbytes);
+
+    if (resp.status != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "uploading to emulator memory ( " _RED_("fail") " )");
+        return resp.status;
+    }
+
+    PrintAndLogEx(SUCCESS, "uploaded " _YELLOW_("%u") " bytes to emulator memory", numofbytes);
+    return PM3_SUCCESS;
 }
 
 static int CmdEM4x50ELoad(const char *Cmd) {
@@ -214,8 +226,12 @@ static int CmdEM4x50ELoad(const char *Cmd) {
     }
 
     // upload to emulator memory
-    em4x50_seteml(data, 0, EM4X50_DUMP_FILESIZE);
-    PrintAndLogEx(HINT, "You are ready to simulate. See " _YELLOW_("`lf em 4x50 sim -h`"));
+    int res = em4x50_seteml(data, 0, EM4X50_DUMP_FILESIZE);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+
+    PrintAndLogEx(HINT, "Hint: Use `" _YELLOW_("lf em 4x50 sim -h") "` to simulate");
     PrintAndLogEx(INFO, "Done!");
     return PM3_SUCCESS;
 }
@@ -340,7 +356,10 @@ static int CmdEM4x50Login(const char *Cmd) {
     clearCommandBuffer();
     PacketResponseNG resp;
     SendCommandNG(CMD_LF_EM4X50_LOGIN, (uint8_t *)&password, sizeof(password));
-    WaitForResponse(CMD_LF_EM4X50_LOGIN, &resp);
+    if (WaitForResponseTimeout(CMD_LF_EM4X50_LOGIN, &resp, 2000) == false) {
+        PrintAndLogEx(WARNING, "timeout while waiting for reply");
+        return PM3_ETIMEOUT;
+    }
 
     // print response
     if (resp.status == PM3_SUCCESS)
@@ -377,8 +396,8 @@ static int CmdEM4x50Brute(const char *Cmd) {
     em4x50_data_t etd;
     memset(&etd, 0, sizeof(etd));
 
-    int mode_len = 64;
     char mode[64];
+    int mode_len = sizeof(mode) - 1; // CLIGetStrWithReturn does not guarantee string to be null-terminated
     CLIGetStrWithReturn(ctx, 1, (uint8_t *) mode, &mode_len);
     PrintAndLogEx(INFO, "Chosen mode: %s", mode);
 
@@ -628,7 +647,7 @@ int em4x50_read(em4x50_data_t *etd, em4x50_word_t *out) {
     SendCommandNG(CMD_LF_EM4X50_READ, (uint8_t *)&edata, sizeof(edata));
     PacketResponseNG resp;
     if (WaitForResponseTimeout(CMD_LF_EM4X50_READ, &resp, EM4X50_TIMEOUT_CMD) == false) {
-        PrintAndLogEx(WARNING, "(em4x50) timeout while waiting for reply.");
+        PrintAndLogEx(WARNING, "(em4x50) timeout while waiting for reply");
         return PM3_ETIMEOUT;
     }
 
@@ -636,10 +655,8 @@ int em4x50_read(em4x50_data_t *etd, em4x50_word_t *out) {
         return PM3_ESOFT;
     }
 
-    em4x50_read_data_response_t *o = (em4x50_read_data_response_t *)resp.data.asBytes;
-
     em4x50_word_t words[EM4X50_NO_WORDS] = {0};
-    em4x50_prepare_result((uint8_t *)o->words, etd->addresses & 0xFF, (etd->addresses >> 8) & 0xFF, words);
+    em4x50_prepare_result(resp.data.asBytes, etd->addresses & 0xFF, (etd->addresses >> 8) & 0xFF, words);
 
     if (out != NULL) {
         memcpy(out, &words, sizeof(em4x50_word_t) * EM4X50_NO_WORDS);
@@ -737,7 +754,7 @@ static int CmdEM4x50Info(const char *Cmd) {
     SendCommandNG(CMD_LF_EM4X50_INFO, (uint8_t *)&etd, sizeof(etd));
     PacketResponseNG resp;
     if (WaitForResponseTimeout(CMD_LF_EM4X50_INFO, &resp, EM4X50_TIMEOUT_CMD) == false) {
-        PrintAndLogEx(WARNING, "Timeout while waiting for reply.");
+        PrintAndLogEx(WARNING, "timeout while waiting for reply");
         return PM3_ETIMEOUT;
     }
 
@@ -777,6 +794,12 @@ static int CmdEM4x50Reader(const char *Cmd) {
 
         // iceman,  misuse of return status code.
         int now = resp.status;
+
+        // prevent massive stack corruption if unexpected results from device.
+        if (now > EM4X50_NO_WORDS) {
+            PrintAndLogEx(WARNING, "word count was: %d, limiting to %d", now, EM4X50_NO_WORDS);
+            now = EM4X50_NO_WORDS;
+        }
 
         if (now > 0) {
 
@@ -854,7 +877,7 @@ static int CmdEM4x50Dump(const char *Cmd) {
     SendCommandNG(CMD_LF_EM4X50_INFO, (uint8_t *)&etd, sizeof(etd));
     PacketResponseNG resp;
     if (WaitForResponseTimeout(CMD_LF_EM4X50_INFO, &resp, EM4X50_TIMEOUT_CMD) == false) {
-        PrintAndLogEx(WARNING, "Timeout while waiting for reply");
+        PrintAndLogEx(WARNING, "timeout while waiting for reply");
         return PM3_ETIMEOUT;
     }
 
@@ -953,7 +976,7 @@ static int CmdEM4x50Write(const char *Cmd) {
     SendCommandNG(CMD_LF_EM4X50_WRITE, (uint8_t *)&etd, sizeof(etd));
     PacketResponseNG resp;
     if (WaitForResponseTimeout(CMD_LF_EM4X50_WRITE, &resp, EM4X50_TIMEOUT_CMD) == false) {
-        PrintAndLogEx(WARNING, "Timeout while waiting for reply.");
+        PrintAndLogEx(WARNING, "timeout while waiting for reply");
         return PM3_ETIMEOUT;
     }
 
@@ -974,7 +997,7 @@ static int CmdEM4x50Write(const char *Cmd) {
     em4x50_prepare_result(data, addr, addr, words);
     em4x50_print_result(words, addr, addr);
     PrintAndLogEx(SUCCESS, "Write ( " _GREEN_("ok") " )");
-    PrintAndLogEx(HINT, "Try `" _YELLOW_("lf em 4x50 rdbl -b %u") "` - to read your data", addr);
+    PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("lf em 4x50 rdbl -b %u") "` - to read your data", addr);
     PrintAndLogEx(INFO, "Done!");
     return PM3_SUCCESS;
 }
@@ -1024,7 +1047,7 @@ static int CmdEM4x50WritePwd(const char *Cmd) {
     clearCommandBuffer();
     SendCommandNG(CMD_LF_EM4X50_WRITEPWD, (uint8_t *)&etd, sizeof(etd));
     if (WaitForResponseTimeout(CMD_LF_EM4X50_WRITEPWD, &resp, EM4X50_TIMEOUT_CMD) == false) {
-        PrintAndLogEx(WARNING, "Timeout while waiting for reply.");
+        PrintAndLogEx(WARNING, "timeout while waiting for reply");
         return PM3_ETIMEOUT;
     }
 
@@ -1082,7 +1105,7 @@ static int CmdEM4x50Wipe(const char *Cmd) {
     clearCommandBuffer();
     SendCommandNG(CMD_LF_EM4X50_WRITEPWD, (uint8_t *)&etd, sizeof(etd));
     if (WaitForResponseTimeout(CMD_LF_EM4X50_WRITEPWD, &resp, EM4X50_TIMEOUT_CMD) == false) {
-        PrintAndLogEx(WARNING, "Timeout while waiting for reply");
+        PrintAndLogEx(WARNING, "timeout while waiting for reply");
         return PM3_ETIMEOUT;
     }
 
@@ -1108,7 +1131,7 @@ static int CmdEM4x50Wipe(const char *Cmd) {
         clearCommandBuffer();
         SendCommandNG(CMD_LF_EM4X50_WRITE, (uint8_t *)&etd, sizeof(etd));
         if (WaitForResponseTimeout(CMD_LF_EM4X50_WRITE, &resp, EM4X50_TIMEOUT_CMD) == false) {
-            PrintAndLogEx(WARNING, "Timeout while waiting for reply.");
+            PrintAndLogEx(WARNING, "timeout while waiting for reply");
             return PM3_ETIMEOUT;
         }
 
@@ -1204,7 +1227,7 @@ static int CmdEM4x50Restore(const char *Cmd) {
         SendCommandNG(CMD_LF_EM4X50_WRITE, (uint8_t *)&etd, sizeof(etd));
         if (WaitForResponseTimeout(CMD_LF_EM4X50_WRITE, &resp, EM4X50_TIMEOUT_CMD) == false) {
             PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(WARNING, "Timeout while waiting for reply.");
+            PrintAndLogEx(WARNING, "timeout while waiting for reply");
             return PM3_ETIMEOUT;
         }
 
@@ -1259,18 +1282,9 @@ static int CmdEM4x50Sim(const char *Cmd) {
 
     PrintAndLogEx(INFO, "Press " _GREEN_("pm3 button") " or " _GREEN_("<Enter>") " to abort simulation");
 
-    PacketResponseNG resp;
     // init to ZERO
-    resp.cmd = 0,
-    resp.length = 0,
-    resp.magic = 0,
-    resp.status = 0,
-    resp.crc = 0,
-    resp.ng = false,
-    resp.oldarg[0] = 0;
-    resp.oldarg[1] = 0;
-    resp.oldarg[2] = 0;
-    memset(resp.data.asBytes, 0, PM3_CMD_DATA_SIZE);
+    PacketResponseNG resp;
+    memset(&resp, 0, sizeof(resp));
 
     bool keypress;
     do {

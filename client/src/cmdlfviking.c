@@ -102,7 +102,7 @@ static int CmdVikingReader(const char *Cmd) {
     do {
         lf_read(false, 10000);
         demodViking(true);
-    } while (cm && !kbd_enter_pressed());
+    } while (cm && (kbd_enter_pressed() == false));
 
     return PM3_SUCCESS;
 }
@@ -172,12 +172,12 @@ static int CmdVikingClone(const char *Cmd) {
 
     SendCommandNG(CMD_LF_VIKING_CLONE, (uint8_t *)&payload, sizeof(payload));
     PacketResponseNG resp;
-    if (!WaitForResponseTimeout(CMD_LF_VIKING_CLONE, &resp, T55XX_WRITE_TIMEOUT)) {
+    if (WaitForResponseTimeout(CMD_LF_VIKING_CLONE, &resp, T55XX_WRITE_TIMEOUT) == false) {
         PrintAndLogEx(ERR, "Error occurred, device did not respond during write operation.");
         return PM3_ETIMEOUT;
     }
-    PrintAndLogEx(SUCCESS, "Done");
-    PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf viking reader`") " to verify");
+    PrintAndLogEx(SUCCESS, "Done!");
+    PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`lf viking reader`") " to verify");
     return resp.status;
 }
 
@@ -218,6 +218,10 @@ static int CmdVikingSim(const char *Cmd) {
     num_to_bytebits(rawID, sizeof(bs), bs);
 
     lf_asksim_t *payload = calloc(1, sizeof(lf_asksim_t) + sizeof(bs));
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
     payload->encoding = 1;
     payload->invert = 0;
     payload->separator = 0;

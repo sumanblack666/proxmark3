@@ -19,10 +19,11 @@
 #include "standalone.h"
 #include "proxmark3_arm.h"
 #include "appmain.h"
-#include "fpgaloader.h"
+#include "fpga_apis.h"
+#include "fpga_loader.h"
 #include "util.h"
 #include "dbprint.h"
-#include "ticks.h"
+#include "ticks_apis.h"
 #include "string.h"
 #include "BigBuf.h"
 #include "iso14443a.h"
@@ -81,9 +82,13 @@ void RunMod() {
 
 
     // UID 4 bytes(could be 7 bytes if needed it)
-    uint8_t flags = FLAG_4B_UID_IN_DATA;
+    uint8_t flags = 0;
+    FLAG_SET_UID_IN_DATA(flags, 4);
     // in case there is a read command received we shouldn't break
-    uint8_t data[PM3_CMD_DATA_SIZE] = {0x00};
+    // only the UID is ever read out of this by SimulateIso14443aInit(), at most
+    // 10 bytes for a triple-cascade UID.  It used to be PM3_CMD_DATA_SIZE, which
+    // put 624 bytes on the stack for nothing.
+    uint8_t data[10] = {0x00};
 
     uint8_t visauid[7] = {0xE9, 0x66, 0x5D, 0x20};
     memcpy(data, visauid, 4);
@@ -128,14 +133,18 @@ void RunMod() {
 #define DYNAMIC_RESPONSE_BUFFER_SIZE 512
 #define DYNAMIC_MODULATION_BUFFER_SIZE 1024
 
-    uint8_t dynamic_response_buffer[DYNAMIC_RESPONSE_BUFFER_SIZE] = {0};
-    uint8_t dynamic_modulation_buffer[DYNAMIC_MODULATION_BUFFER_SIZE] = {0};
+    // These live in BigBuf, not on the stack - together they are 1536 bytes, and
+    // RunMod() already carries the deepest frame in the firmware.  Same pattern as
+    // SimulateIso14443aTagEx() in iso14443a.c.  Filled in after the emulator is
+    // initialized, because SimulateIso14443aInit() allocates from BigBuf too.
+    uint8_t *dynamic_response_buffer = NULL;
+    uint8_t *dynamic_modulation_buffer = NULL;
 
     // Command response - handler
     tag_response_info_t dynamic_response_info = {
-        .response = dynamic_response_buffer,
+        .response = NULL,
         .response_n = 0,
-        .modulation = dynamic_modulation_buffer,
+        .modulation = NULL,
         .modulation_n = 0
     };
 
@@ -224,7 +233,7 @@ void RunMod() {
                                 DbpString(_YELLOW_("[ ") "Bluetooth data:" _YELLOW_(" ]"));
                                 Dbhexdump(lenpacket, rpacket, false);
 
-                                apdulen = iso14_apdu(rpacket, (uint16_t) lenpacket, false, apdubuffer, NULL);
+                                apdulen = iso14_apdu(rpacket, lenpacket, false, apdubuffer, sizeof(apdubuffer), NULL);
 
                                 DbpString(_YELLOW_("[ ") "Card response:" _YELLOW_(" ]"));
                                 Dbhexdump(apdulen - 2, apdubuffer, false);
@@ -267,7 +276,7 @@ void RunMod() {
             BigBuf_free_keep_EM();
 
             // 4 = ISO/IEC 14443-4 - javacard (JCOP)
-            if (SimulateIso14443aInit(4, flags, data, &responses, &cuid, NULL, NULL, NULL) == false) {
+            if (SimulateIso14443aInit(4, flags, data, NULL, 0, &responses, &cuid, NULL, NULL) == false) {
                 BigBuf_free_keep_EM();
                 reply_ng(CMD_HF_MIFARE_SIMULATE, PM3_EINIT, NULL, 0);
                 DbpString(_RED_("Error initializing the emulation process!"));
@@ -276,6 +285,20 @@ void RunMod() {
                 DbpString("Initialized [ "_YELLOW_("reading mode") " ]");
                 continue;
             }
+
+            dynamic_response_buffer = BigBuf_calloc(DYNAMIC_RESPONSE_BUFFER_SIZE);
+            dynamic_modulation_buffer = BigBuf_calloc(DYNAMIC_MODULATION_BUFFER_SIZE);
+            if (dynamic_response_buffer == NULL || dynamic_modulation_buffer == NULL) {
+                BigBuf_free_keep_EM();
+                reply_ng(CMD_HF_MIFARE_SIMULATE, PM3_EMALLOC, NULL, 0);
+                DbpString(_RED_("Cannot allocate the response buffers!"));
+                SpinDelay(500);
+                state = STATE_READ;
+                DbpString("Initialized [ "_YELLOW_("reading mode") " ]");
+                continue;
+            }
+            dynamic_response_info.response = dynamic_response_buffer;
+            dynamic_response_info.modulation = dynamic_modulation_buffer;
 
             // We need to listen to the high-frequency, peak-detected path.
             iso14443a_setup(FPGA_HF_ISO14443A_TAGSIM_LISTEN);
@@ -298,7 +321,7 @@ void RunMod() {
             for (;;) {
                 LED_B_OFF();
                 // Clean receive command buffer
-                if (GetIso14443aCommandFromReader(receivedCmd, receivedCmdPar, &len) == false) {
+                if (GetIso14443aCommandFromReader(receivedCmd, sizeof(receivedCmd), receivedCmdPar, &len) == false) {
                     DbpString("Emulator stopped");
                     retval = PM3_EOPABORTED;
                     break;
@@ -337,7 +360,7 @@ void RunMod() {
                 } else if (receivedCmd[1] == 0x70 && receivedCmd[0] == ISO14443A_CMD_ANTICOLL_OR_SELECT && len == 9) {  // Received a SELECT (cascade 1)
                     p_response = &responses[RESP_INDEX_SAKC1];
                 } else if (receivedCmd[0] == ISO14443A_CMD_RATS && len == 4) {  // Received a RATS request
-                    p_response = &responses[RESP_INDEX_RATS];
+                    p_response = &responses[RESP_INDEX_ATS];
                     resp = 1;
                 } else if (receivedCmd[0] == 0xf2 && len == 4) {  // ACKed - Time extension
                     DbpString(_YELLOW_("!!") " Reader accepted time extension!");

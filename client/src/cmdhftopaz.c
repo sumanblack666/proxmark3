@@ -41,32 +41,33 @@
 static topaz_tag_t topaz_tag;
 
 static void topaz_switch_on_field(void) {
-    SendCommandMIX(CMD_HF_ISO14443A_READER, ISO14A_CONNECT | ISO14A_NO_SELECT | ISO14A_NO_DISCONNECT | ISO14A_TOPAZMODE | ISO14A_NO_RATS, 0, 0, NULL, 0);
+    SendIso14aReader(ISO14A_CONNECT | ISO14A_CLEARTRACE | ISO14A_NO_SELECT | ISO14A_NO_DISCONNECT | ISO14A_TOPAZMODE | ISO14A_NO_RATS, NULL, 0);
 }
 
 static void topaz_switch_off_field(void) {
     SetISODEPState(ISODEP_INACTIVE);
-    SendCommandMIX(CMD_HF_ISO14443A_READER, 0, 0, 0, NULL, 0);
+    SendIso14aReader(0, NULL, 0);
 }
 
 // send a raw topaz command, returns the length of the response (0 in case of error)
 static int topaz_send_cmd_raw(uint8_t *cmd, uint8_t len, uint8_t *response, uint16_t *response_len, bool verbose) {
-    SendCommandMIX(CMD_HF_ISO14443A_READER, ISO14A_RAW | ISO14A_NO_DISCONNECT | ISO14A_TOPAZMODE | ISO14A_NO_RATS, len, 0, cmd, len);
+    SendIso14aReader(ISO14A_RAW | ISO14A_NO_DISCONNECT | ISO14A_TOPAZMODE | ISO14A_NO_RATS, cmd, len);
     PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_ACK, &resp, 1500) == false) {
-        if (verbose) PrintAndLogEx(WARNING, "timeout while waiting for reply.");
+    uint16_t rlen_56 = 0;
+    if (WaitForIso14aReply(&resp, 1500, &rlen_56, NULL) == false) {
+        if (verbose) PrintAndLogEx(WARNING, "timeout while waiting for reply");
         return PM3_ETIMEOUT;
     }
 
-    if (resp.oldarg[0] == *response_len) {
-        *response_len = resp.oldarg[0];
+    if (rlen_56 == *response_len) {
+        *response_len = rlen_56;
 
         PrintAndLogEx(DEBUG, "%s", sprint_hex(resp.data.asBytes, *response_len));
         if (*response_len > 0) {
             memcpy(response, resp.data.asBytes, *response_len);
         }
     } else {
-        if (verbose) PrintAndLogEx(WARNING, "Wrong response length (%d != %" PRIu64 ")", *response_len, resp.oldarg[0]);
+        if (verbose) PrintAndLogEx(WARNING, "Wrong response length (%d != %u)", *response_len, rlen_56);
         return PM3_ESOFT;
     }
     return PM3_SUCCESS;
@@ -109,7 +110,7 @@ static int topaz_select(uint8_t *atqa, uint8_t atqa_len, uint8_t *rid_response, 
 }
 
 // read all of the static memory of a selected Topaz tag.
-static int topaz_rall(uint8_t *uid, uint8_t *response) {
+static int topaz_rall(const uint8_t *uid, uint8_t *response) {
 
     uint16_t resp_len = 124;
     uint8_t rall_cmd[] = {TOPAZ_RALL, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -362,6 +363,7 @@ static int topaz_set_cc_dynamic(const uint8_t *data) {
     topaz_tag.size = memsize;
     topaz_tag.dynamic_memory = calloc(memsize - TOPAZ_STATIC_MEMORY, sizeof(uint8_t));
     if (topaz_tag.dynamic_memory == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
     return PM3_SUCCESS;
@@ -542,11 +544,19 @@ static void topaz_print_control_TLVs(uint8_t *memory) {
 
             if (old == NULL) {
                 new = topaz_tag.dynamic_lock_areas = (dynamic_lock_area_t *) calloc(sizeof(dynamic_lock_area_t), sizeof(uint8_t));
+                if (new == NULL) {
+                    PrintAndLogEx(WARNING, "Failed to allocate memory");
+                    return;
+                }
             } else {
                 while (old->next != NULL) {
                     old = old->next;
                 }
                 new = old->next = (dynamic_lock_area_t *) calloc(sizeof(dynamic_lock_area_t), sizeof(uint8_t));
+                if (new == NULL) {
+                    PrintAndLogEx(WARNING, "Failed to allocate memory");
+                    return;
+                }
             }
             new->next = NULL;
 
@@ -837,8 +847,8 @@ static int CmdHFTopazSniff(const char *Cmd) {
     PacketResponseNG resp;
     WaitForResponse(CMD_HF_ISO14443A_SNIFF, &resp);
     PrintAndLogEx(INFO, "Done!");
-    PrintAndLogEx(HINT, "Try `" _YELLOW_("hf topaz list")"` to view captured tracelog");
-    PrintAndLogEx(HINT, "Try `" _YELLOW_("trace save -h") "` to save tracelog for later analysing");
+    PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf topaz list")"` to view captured tracelog");
+    PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("trace save -h") "` to save tracelog for later analysing");
     return PM3_SUCCESS;
 }
 
@@ -904,10 +914,14 @@ static int CmdHFTopazDump(const char *Cmd) {
         FillFileNameByUID(filename, topaz_tag.uid, "-dump", sizeof(topaz_tag.uid));
     }
 
-    if (topaz_tag.size)
-        pm3_save_dump(filename, (uint8_t *)&topaz_tag, sizeof(topaz_tag_t) + topaz_tag.size, jsfTopaz);
-    else
+    if (topaz_tag.size > TOPAZ_STATIC_MEMORY) {
+        uint8_t mem[TOPAZ_MAX_SIZE];
+        memcpy(mem, topaz_tag.data_blocks, TOPAZ_STATIC_MEMORY);
+        memcpy(mem + TOPAZ_STATIC_MEMORY, topaz_tag.dynamic_memory, topaz_tag.size - TOPAZ_STATIC_MEMORY);
+        pm3_save_dump(filename, mem, topaz_tag.size, jsfTopaz);
+    } else {
         pm3_save_dump(filename, (uint8_t *)&topaz_tag, sizeof(topaz_tag_t), jsfTopaz);
+    }
 
     if (set_dynamic) {
         free(topaz_tag.dynamic_memory);
@@ -1052,7 +1066,7 @@ static int CmdHFTopazWrBl(const char *Cmd) {
 
     if (res == PM3_SUCCESS) {
         PrintAndLogEx(SUCCESS, "Write ( " _GREEN_("ok") " )");
-        PrintAndLogEx(HINT, "try `" _YELLOW_("hf topaz rdbl --blk %u") "` to verify", blockno);
+        PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf topaz rdbl --blk %u") "` to verify", blockno);
 
     } else {
         PrintAndLogEx(WARNING, "Write ( " _RED_("fail") " )");
@@ -1171,7 +1185,7 @@ int readTopazUid(bool loop, bool verbose) {
         topaz_tag.HR01[0] = rid_response[0];
         topaz_tag.HR01[1] = rid_response[1];
 
-    } while (loop && kbd_enter_pressed() == false);
+    } while (loop && (kbd_enter_pressed() == false));
 
     topaz_switch_off_field();
     return res;

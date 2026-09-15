@@ -20,9 +20,12 @@
 #define _MIFARE_H_
 
 #include "common.h"
+#include "pm3_cmd.h"   // PM3_CMD_DATA_SIZE
 
+// These are also used to construct AUTH commands (60+x)
 #define MF_KEY_A 0
 #define MF_KEY_B 1
+#define MF_KEY_BD 4
 
 #define MF_MAD1_SECTOR 0x00
 #define MF_MAD2_SECTOR 0x10
@@ -81,6 +84,12 @@ typedef struct {
     uint8_t *dump;
 } iso14a_mf_dump_ev1_t;
 
+typedef struct {
+    uint8_t nt[17][2][4];
+    uint8_t nt_enc[17][2][4];
+    uint8_t par_err[17][2];
+    uint8_t blocks[64][16]; // [MIFARE_1K_MAXSECTOR * 4][MFBLOCK_SIZE]
+} iso14a_fm11rf08s_nonces_with_data_t;
 
 typedef enum ISO14A_COMMAND {
     ISO14A_CONNECT = (1 << 0),
@@ -94,27 +103,45 @@ typedef enum ISO14A_COMMAND {
     ISO14A_TOPAZMODE = (1 << 8),
     ISO14A_NO_RATS = (1 << 9),
     ISO14A_SEND_CHAINING = (1 << 10),
-    ISO14A_USE_ECP = (1 << 11),
-    ISO14A_USE_MAGSAFE = (1 << 12),
-    ISO14A_USE_CUSTOM_POLLING = (1 << 13)
+    // 11, 12 were used for ECP & MAGSAFE, but they were generalized into CUSTOM_POLLING
+    // In case there is a need to add a new flag, feel free to use those indices
+    ISO14A_USE_CUSTOM_POLLING = (1 << 13),
+    ISO14A_CRYPTO1MODE = (1 << 14),
+    ISO14A_SET_WAIT_US = (1 << 15),
+    ISO14A_APPEND_CMAC = (1 << 16),
+    ISO14A_CLEARTRACE = (1 << 17),
+    ISO14A_NO_PARITY = (1 << 18),
 } iso14a_command_t;
 
-// Defines a frame that will be used in a polling sequence
-// ECP Frames are up to (7 + 16) bytes long, 24 bytes should cover future and other cases
+// CMD_HF_ISO14443A_READER payload.
+// Replaces the oldarg packing this command used to ride on:
+//   arg0 = flags
+//   arg1 = (lenbits << 16) | len
+//   arg2 = (wait_us << 32) | timeout
 typedef struct {
-    uint8_t frame[24];
-    uint8_t frame_length;
-    uint8_t last_byte_bits;
-    uint16_t extra_delay;
-} PACKED iso14a_polling_frame_t;
+    uint32_t flags;     // iso14a_command_t bitmask, needs 19 bits today
+    uint32_t timeout;   // in ETUs, only read when ISO14A_SET_TIMEOUT is set
+    uint32_t wait_us;   // only read when ISO14A_SET_WAIT_US is set
+    uint16_t len;       // bytes in data[]
+    uint16_t lenbits;   // send this many bits instead of whole bytes, 0 = off
+    uint8_t data[];
+} PACKED iso14a_raw_cmd_t;
 
-// Defines polling sequence configuration
-// 6 would be enough for 4 magsafe, 1 wupa, 1 ecp,
+#define ISO14A_RAW_LEN(x) (sizeof(iso14a_raw_cmd_t) + (x))
+
+// Reply to CMD_HF_ISO14443A_READER.
+// Replaces the anonymous CMD_ACK this command used to answer with:
+//   arg0 = select status on a CONNECT, otherwise the response length
+//   arg1 = uidlen on a CONNECT (also in the card struct), or the APDU res byte
 typedef struct {
-    iso14a_polling_frame_t frames[6];
-    uint8_t frame_count;
-    uint16_t extra_timeout;
-} PACKED iso14a_polling_parameters_t;
+    uint16_t len;   // bytes in data[]
+    uint8_t sel;    // select status on CONNECT, APDU res byte, else 0
+    uint8_t rfu;
+    uint8_t data[];
+} PACKED iso14a_raw_resp_t;
+
+#define ISO14A_RESP_LEN(x) (sizeof(iso14a_raw_resp_t) + (x))
+#define ISO14A_RESP_MAXLEN (PM3_CMD_DATA_SIZE - sizeof(iso14a_raw_resp_t))
 
 typedef struct {
     uint8_t *response;
@@ -157,6 +184,13 @@ typedef enum {
 //-----------------------------------------------------------------------------
 // "hf 14a sim -x", "hf mf sim -x" attacks
 //-----------------------------------------------------------------------------
+typedef enum {
+    EMPTY,
+    FIRST,
+    SECOND,
+    NESTED
+} nonce_state;
+
 typedef struct {
     uint32_t cuid;
     uint32_t nonce;
@@ -168,11 +202,7 @@ typedef struct {
     uint32_t nr2;
     uint8_t  sector;
     uint8_t  keytype;
-    enum {
-        EMPTY,
-        FIRST,
-        SECOND,
-    } state;
+    uint8_t  state;
 } PACKED nonces_t;
 
 #endif // _MIFARE_H_

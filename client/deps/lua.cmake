@@ -7,6 +7,7 @@ add_library(pm3rrg_rdv4_lua STATIC
         liblua/ldump.c
         liblua/lfunc.c
         liblua/lgc.c
+        liblua/linit.c
         liblua/llex.c
         liblua/lmem.c
         liblua/lobject.c
@@ -21,16 +22,15 @@ add_library(pm3rrg_rdv4_lua STATIC
         liblua/lzio.c
         liblua/lauxlib.c
         liblua/lbaselib.c
-        liblua/lbitlib.c
         liblua/lcorolib.c
         liblua/ldblib.c
         liblua/liolib.c
         liblua/lmathlib.c
+        liblua/loadlib.c
         liblua/loslib.c
         liblua/lstrlib.c
         liblua/ltablib.c
-        liblua/loadlib.c
-        liblua/linit.c
+        liblua/lutf8lib.c
 )
 
 target_compile_definitions(pm3rrg_rdv4_lua PRIVATE LUA_COMPAT_ALL)
@@ -52,5 +52,5 @@ if (NOT MINGW)
 endif (NOT MINGW)
 
 target_include_directories(pm3rrg_rdv4_lua INTERFACE liblua)
-target_compile_options(pm3rrg_rdv4_lua PRIVATE -Wall -Werror -O3)
+target_compile_options(pm3rrg_rdv4_lua PRIVATE -Wall -Werror -Wno-missing-braces -Wno-deprecated-declarations -O3)
 set_property(TARGET pm3rrg_rdv4_lua PROPERTY POSITION_INDEPENDENT_CODE ON)

@@ -21,7 +21,8 @@
 
 #include "standalone.h" // standalone definitions
 #include "proxmark3_arm.h"
-#include "fpgaloader.h"
+#include "fpga_loader.h"
+#include "fpga_apis.h"
 #include "iso15693.h"
 #include "iso15.h"
 #include "protocols.h"
@@ -30,7 +31,7 @@
 #include "spiffs.h"
 #include "appmain.h"
 #include "dbprint.h"
-#include "ticks.h"
+#include "ticks_apis.h"
 #include "BigBuf.h"
 #include "crc16.h"
 
@@ -70,7 +71,9 @@ void RunMod(void) {
     FpgaDownloadAndGo(FPGA_BITSTREAM_HF_15);
 
     iso15_tag_t *tag = (iso15_tag_t *) BigBuf_get_EM_addr();
-    if (tag == NULL) return;
+    if (tag == NULL) {
+        return;
+    }
 
     uint8_t cmd[8] = {0};
     int res;

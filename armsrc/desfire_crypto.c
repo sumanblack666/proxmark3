@@ -31,7 +31,7 @@
 #include "crc32.h"
 #include "crc.h"
 #include "crc16.h"        // crc16 ccitt
-#include "printf.h"
+#include "nprintf.h"
 #include "iso14443a.h"
 #include "dbprint.h"
 #include "BigBuf.h"
@@ -65,25 +65,32 @@ void des_decrypt(void *out, const void *in, const void *key) {
     mbedtls_des_crypt_ecb(&ctx, in, out);
 }
 
-void tdes_nxp_receive(const void *in, void *out, size_t length, const void *key, unsigned char iv[8], int keymode) {
-    if (length % 8) return;
-    if (keymode == 2)
-        mbedtls_des3_set2key_dec(&ctx3, key);
-    else
-        mbedtls_des3_set3key_dec(&ctx3, key);
+void tdes_nxp_receive(const void *in, void *out, size_t length, const void *key, uint8_t *iv, int keymode) {
 
-    uint8_t i;
+    // must be even blocks of 8 bytes.
+    if (length % 8) {
+        return;
+    }
+
+    if (keymode == 2) {
+        mbedtls_des3_set2key_dec(&ctx3, key);
+    } else {
+        mbedtls_des3_set3key_dec(&ctx3, key);
+    }
+
     unsigned char temp[8];
     uint8_t *tin = (uint8_t *) in;
     uint8_t *tout = (uint8_t *) out;
 
     while (length > 0) {
+
         memcpy(temp, tin, 8);
 
         mbedtls_des3_crypt_ecb(&ctx3, tin, tout);
 
-        for (i = 0; i < 8; i++)
-            tout[i] = (unsigned char)(tout[i] ^ iv[i]);
+        for (uint8_t i = 0; i < 8; i++) {
+            tout[i] ^= iv[i];
+        }
 
         memcpy(iv, temp, 8);
 
@@ -93,20 +100,26 @@ void tdes_nxp_receive(const void *in, void *out, size_t length, const void *key,
     }
 }
 
-void tdes_nxp_send(const void *in, void *out, size_t length, const void *key, unsigned char iv[8], int keymode) {
-    if (length % 8) return;
-    if (keymode == 2)
-        mbedtls_des3_set2key_enc(&ctx3, key);
-    else
-        mbedtls_des3_set3key_enc(&ctx3, key);
+void tdes_nxp_send(const void *in, void *out, size_t length, const void *key, uint8_t *iv, int keymode) {
 
-    uint8_t i;
+    // must be even blocks of 8 bytes.
+    if (length % 8) {
+        return;
+    }
+
+    if (keymode == 2) {
+        mbedtls_des3_set2key_enc(&ctx3, key);
+    } else {
+        mbedtls_des3_set3key_enc(&ctx3, key);
+    }
+
     uint8_t *tin = (uint8_t *) in;
     uint8_t *tout = (uint8_t *) out;
 
     while (length > 0) {
-        for (i = 0; i < 8; i++) {
-            tin[i] = (unsigned char)(tin[i] ^ iv[i]);
+
+        for (uint8_t i = 0; i < 8; i++) {
+            tin[i] ^= iv[i];
         }
 
         mbedtls_des3_crypt_ecb(&ctx3, tin, tout);
@@ -120,7 +133,9 @@ void tdes_nxp_send(const void *in, void *out, size_t length, const void *key, un
 }
 
 void aes128_nxp_receive(const void *in, void *out, size_t length, const void *key, unsigned char iv[16]) {
-    if (length % 8) return;
+    if (length % 8) {
+        return;
+    }
 
     uint8_t *tin = (uint8_t *) in;
     uint8_t *tout = (uint8_t *) out;
@@ -130,7 +145,9 @@ void aes128_nxp_receive(const void *in, void *out, size_t length, const void *ke
 }
 
 void aes128_nxp_send(const void *in, void *out, size_t length, const void *key, unsigned char iv[16]) {
-    if (length % 8) return;
+    if (length % 8) {
+        return;
+    }
 
     uint8_t *tin = (uint8_t *) in;
     uint8_t *tout = (uint8_t *) out;
@@ -139,12 +156,15 @@ void aes128_nxp_send(const void *in, void *out, size_t length, const void *key, 
     mbedtls_aes_crypt_cbc(&actx, MBEDTLS_AES_ENCRYPT, length, iv, tin, tout);
 }
 
-void Desfire_des_key_new(const uint8_t value[8], desfirekey_t key) {
-    uint8_t data[8];
-    memcpy(data, value, 8);
-    for (int n = 0; n < 8; n++) {
+void Desfire_des_key_new(const uint8_t *value, desfirekey_t key) {
+
+    uint8_t data[8] = {0};
+    memcpy(data, value, sizeof(data));
+
+    for (size_t n = 0; n < sizeof(data); n++) {
         data[n] &= 0xFE;
     }
+
     Desfire_des_key_new_with_version(data, key);
 }
 
@@ -233,22 +253,24 @@ void Desfire_key_set_version(desfirekey_t key, uint8_t version) {
 
 void Desfire_session_key_new(const uint8_t rnda[], const uint8_t rndb[], desfirekey_t authkey, desfirekey_t key) {
 
-    uint8_t buffer[24];
+    uint8_t buffer[24] = {0};
 
     switch (authkey->type) {
-        case T_DES:
+        case T_DES: {
             memcpy(buffer, rnda, 4);
             memcpy(buffer + 4, rndb, 4);
             Desfire_des_key_new_with_version(buffer, key);
             break;
-        case T_3DES:
+        }
+        case T_3DES: {
             memcpy(buffer, rnda, 4);
             memcpy(buffer + 4, rndb, 4);
             memcpy(buffer + 8, rnda + 4, 4);
             memcpy(buffer + 12, rndb + 4, 4);
             Desfire_3des_key_new_with_version(buffer, key);
             break;
-        case T_3K3DES:
+        }
+        case T_3K3DES: {
             memcpy(buffer, rnda, 4);
             memcpy(buffer + 4, rndb, 4);
             memcpy(buffer + 8, rnda + 6, 4);
@@ -257,22 +279,15 @@ void Desfire_session_key_new(const uint8_t rnda[], const uint8_t rndb[], desfire
             memcpy(buffer + 20, rndb + 12, 4);
             Desfire_3k3des_key_new(buffer, key);
             break;
-        case T_AES:
+        }
+        case T_AES: {
             memcpy(buffer, rnda, 4);
             memcpy(buffer + 4, rndb, 4);
             memcpy(buffer + 8, rnda + 12, 4);
             memcpy(buffer + 12, rndb + 12, 4);
             Desfire_aes_key_new(buffer, key);
             break;
-    }
-}
-
-static size_t key_macing_length(desfirekey_t key);
-
-// iceman,  see memxor inside string.c, dest/src swapped..
-static void xor(const uint8_t *ivect, uint8_t *data, const size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        data[i] ^= ivect[i];
+        }
     }
 }
 
@@ -293,7 +308,7 @@ void cmac_generate_subkeys(desfirekey_t key) {
     // Used to compute CMAC on complete blocks
     memcpy(key->cmac_sk1, l, kbs);
 
-    txor = l[0] & 0x80;
+    txor = (l[0] & 0x80);
 
     lsl(key->cmac_sk1, kbs);
 
@@ -304,7 +319,7 @@ void cmac_generate_subkeys(desfirekey_t key) {
     // Used to compute CMAC on the last block if non-complete
     memcpy(key->cmac_sk2, key->cmac_sk1, kbs);
 
-    txor = key->cmac_sk1[0] & 0x80;
+    txor = (key->cmac_sk1[0] & 0x80);
 
     lsl(key->cmac_sk2, kbs);
 
@@ -319,7 +334,10 @@ void cmac(const desfirekey_t key, uint8_t *ivect, const uint8_t *data, size_t le
         return;
     }
 
-    uint8_t *buffer = BigBuf_malloc(padded_data_length(len, kbs));
+    uint8_t *buffer = BigBuf_calloc(padded_data_length(len, kbs));
+    if (buffer == NULL) {
+        return;
+    }
 
     memcpy(buffer, data, len);
 
@@ -328,15 +346,14 @@ void cmac(const desfirekey_t key, uint8_t *ivect, const uint8_t *data, size_t le
         while (len % kbs) {
             buffer[len++] = 0x00;
         }
-        xor(key->cmac_sk2, buffer + len - kbs, kbs);
+        xor(buffer + len - kbs, key->cmac_sk2, kbs);
     } else {
-        xor(key->cmac_sk1, buffer + len - kbs, kbs);
+        xor(buffer + len - kbs, key->cmac_sk1, kbs);
     }
 
     mifare_cypher_blocks_chained(NULL, key, ivect, buffer, len, MCD_SEND, MCO_ENCYPHER);
 
     memcpy(cmac, ivect, kbs);
-    //free(buffer);
 }
 
 size_t key_block_size(const desfirekey_t key) {
@@ -361,7 +378,7 @@ size_t key_block_size(const desfirekey_t key) {
 /*
  * Size of MACing produced with the key.
  */
-static size_t key_macing_length(const desfirekey_t key) {
+size_t key_macing_length(const desfirekey_t key) {
     size_t mac_length = DESFIRE_MAC_LENGTH;
     switch (key->type) {
         case T_DES:
@@ -380,10 +397,11 @@ static size_t key_macing_length(const desfirekey_t key) {
  * Size required to store nbytes of data in a buffer of size n*block_size.
  */
 size_t padded_data_length(const size_t nbytes, const size_t block_size) {
-    if ((!nbytes) || (nbytes % block_size))
+    if ((!nbytes) || (nbytes % block_size)) {
         return ((nbytes / block_size) + 1) * block_size;
-    else
+    } else {
         return nbytes;
+    }
 }
 
 /*
@@ -399,12 +417,14 @@ size_t enciphered_data_length(const desfiretag_t tag, const size_t nbytes, int c
     size_t crc_length = 0;
     if (!(communication_settings & NO_CRC)) {
         switch (DESFIRE(tag)->authentication_scheme) {
-            case AS_LEGACY:
+            case AS_LEGACY: {
                 crc_length = 2;
                 break;
-            case AS_NEW:
+            }
+            case AS_NEW: {
                 crc_length = 4;
                 break;
+            }
         }
     }
 
@@ -415,18 +435,20 @@ size_t enciphered_data_length(const desfiretag_t tag, const size_t nbytes, int c
 
 void *mifare_cryto_preprocess_data(desfiretag_t tag, void *data, size_t *nbytes, size_t offset, int communication_settings) {
     uint8_t *res = data;
-    uint8_t mac[4];
+    uint8_t mac[4] = {0};
     size_t edl;
     bool append_mac = true;
-    desfirekey_t key = DESFIRE(tag)->session_key;
 
-    if (!key)
+    desfirekey_t key = DESFIRE(tag)->session_key;
+    if (!key) {
         return data;
+    }
 
     switch (communication_settings & MDCM_MASK) {
-        case MDCM_PLAIN:
-            if (AS_LEGACY == DESFIRE(tag)->authentication_scheme)
+        case MDCM_PLAIN: {
+            if (AS_LEGACY == DESFIRE(tag)->authentication_scheme) {
                 break;
+            }
 
             /*
              * When using new authentication methods, PLAIN data transmission from
@@ -439,13 +461,16 @@ void *mifare_cryto_preprocess_data(desfiretag_t tag, void *data, size_t *nbytes,
              */
 
             append_mac = false;
-
+        }
         /* pass through */
-        case MDCM_MACED:
+        case MDCM_MACED: {
             switch (DESFIRE(tag)->authentication_scheme) {
-                case AS_LEGACY:
-                    if (!(communication_settings & MAC_COMMAND))
+                case AS_LEGACY: {
+
+                    if (!(communication_settings & MAC_COMMAND)) {
                         break;
+                    }
+
 
                     /* pass through */
                     edl = padded_data_length(*nbytes - offset, key_block_size(DESFIRE(tag)->session_key)) + offset;
@@ -462,8 +487,6 @@ void *mifare_cryto_preprocess_data(desfiretag_t tag, void *data, size_t *nbytes,
                     // Copy again provided data (was overwritten by mifare_cypher_blocks_chained)
                     memcpy(res, data, *nbytes);
 
-                    if (!(communication_settings & MAC_COMMAND))
-                        break;
                     // Append MAC
                     size_t bla = maced_data_length(DESFIRE(tag)->session_key, *nbytes - offset) + offset;
                     (void)bla++;
@@ -472,9 +495,12 @@ void *mifare_cryto_preprocess_data(desfiretag_t tag, void *data, size_t *nbytes,
 
                     *nbytes += 4;
                     break;
-                case AS_NEW:
-                    if (!(communication_settings & CMAC_COMMAND))
+                }
+                case AS_NEW: {
+                    if (!(communication_settings & CMAC_COMMAND)) {
                         break;
+                    }
+
                     cmac(key, DESFIRE(tag)->ivect, res, *nbytes, DESFIRE(tag)->cmac);
 
                     if (append_mac) {
@@ -485,10 +511,11 @@ void *mifare_cryto_preprocess_data(desfiretag_t tag, void *data, size_t *nbytes,
                         *nbytes += DESFIRE_CMAC_LENGTH;
                     }
                     break;
+                }
             }
-
             break;
-        case MDCM_ENCIPHERED:
+        }
+        case MDCM_ENCIPHERED: {
             /*  |<-------------- data -------------->|
              *  |<--- offset -->|                    |
              *  +---------------+--------------------+-----+---------+
@@ -504,8 +531,10 @@ void *mifare_cryto_preprocess_data(desfiretag_t tag, void *data, size_t *nbytes,
              *                            encypher()/decypher()
              */
 
-            if (!(communication_settings & ENC_COMMAND))
+            if (!(communication_settings & ENC_COMMAND)) {
                 break;
+            }
+
             edl = enciphered_data_length(tag, *nbytes - offset, communication_settings) + offset;
 
             // Fill in the crypto buffer with data ...
@@ -513,14 +542,16 @@ void *mifare_cryto_preprocess_data(desfiretag_t tag, void *data, size_t *nbytes,
             if (!(communication_settings & NO_CRC)) {
                 // ... CRC ...
                 switch (DESFIRE(tag)->authentication_scheme) {
-                    case AS_LEGACY:
+                    case AS_LEGACY: {
                         AddCrc14A(res + offset, *nbytes - offset);
                         *nbytes += 2;
                         break;
-                    case AS_NEW:
+                    }
+                    case AS_NEW: {
                         crc32_append(res, *nbytes);
                         *nbytes += 4;
                         break;
+                    }
                 }
             }
             // ... and padding
@@ -530,31 +561,33 @@ void *mifare_cryto_preprocess_data(desfiretag_t tag, void *data, size_t *nbytes,
 
             mifare_cypher_blocks_chained(tag, NULL, NULL, res + offset, *nbytes - offset, MCD_SEND, (AS_NEW == DESFIRE(tag)->authentication_scheme) ? MCO_ENCYPHER : MCO_DECYPHER);
             break;
-        default:
-
+        }
+        default: {
             *nbytes = -1;
             res = NULL;
             break;
+        }
     }
 
     return res;
-
 }
 
 void *mifare_cryto_postprocess_data(desfiretag_t tag, void *data, size_t *nbytes, int communication_settings) {
+
     void *res = data;
-    uint8_t first_cmac_byte = 0x00;
-
-    desfirekey_t key = DESFIRE(tag)->session_key;
-
-    if (!key) {
-        return data;
-    }
 
     // Return directly if we just have a status code.
     if (1 == *nbytes) {
         return res;
     }
+
+
+    desfirekey_t key = DESFIRE(tag)->session_key;
+    if (!key) {
+        return data;
+    }
+
+    uint8_t first_cmac_byte = 0x00;
 
     switch (communication_settings & MDCM_MASK) {
         case MDCM_PLAIN: {
@@ -569,6 +602,15 @@ void *mifare_cryto_postprocess_data(desfiretag_t tag, void *data, size_t *nbytes
                 case AS_LEGACY: {
 
                     if ((communication_settings & MAC_VERIFY) == MAC_VERIFY) {
+
+                        if (*nbytes < key_macing_length(key)) {
+                            *nbytes = -1;
+                            res = NULL;
+#ifdef WITH_DEBUG
+                            Dbprintf("No room for MAC!");
+#endif
+                            break;
+                        }
 
                         *nbytes -= key_macing_length(key);
 
@@ -646,11 +688,12 @@ void *mifare_cryto_postprocess_data(desfiretag_t tag, void *data, size_t *nbytes
             break;
         }
         case MDCM_ENCIPHERED: {
+
             (*nbytes)--;
+
             bool verified = false;
             int crc_pos = 0x00;
             int end_crc_pos = 0x00;
-            uint8_t x;
 
             /*
              * AS_LEGACY:
@@ -729,8 +772,9 @@ void *mifare_cryto_postprocess_data(desfiretag_t tag, void *data, size_t *nbytes
                     verified = true;
                     for (int n = end_crc_pos; n < *nbytes - 1; n++) {
                         uint8_t byte = ((uint8_t *)res)[n];
-                        if (!((0x00 == byte) || ((0x80 == byte) && (n == end_crc_pos))))
+                        if (!((0x00 == byte) || ((0x80 == byte) && (n == end_crc_pos)))) {
                             verified = false;
+                        }
                     }
                 }
 
@@ -755,7 +799,7 @@ void *mifare_cryto_postprocess_data(desfiretag_t tag, void *data, size_t *nbytes
                             break;
                         }
                         case AS_NEW: {
-                            x = ((uint8_t *)res)[crc_pos - 1];
+                            uint8_t x = ((uint8_t *)res)[crc_pos - 1];
                             ((uint8_t *)res)[crc_pos - 1] = ((uint8_t *)res)[crc_pos];
                             ((uint8_t *)res)[crc_pos] = x;
                             break;
@@ -789,9 +833,10 @@ void *mifare_cryto_postprocess_data(desfiretag_t tag, void *data, size_t *nbytes
 
 
 void mifare_cypher_single_block(desfirekey_t key, uint8_t *data, uint8_t *ivect, MifareCryptoDirection direction, MifareCryptoOperation operation, size_t block_size) {
+
     uint8_t ovect[DESFIRE_MAX_CRYPTO_BLOCK_SIZE];
     if (direction == MCD_SEND) {
-        xor(ivect, data, block_size);
+        xor(data, ivect, block_size);
     } else {
         memcpy(ovect, data, block_size);
     }
@@ -799,70 +844,80 @@ void mifare_cypher_single_block(desfirekey_t key, uint8_t *data, uint8_t *ivect,
     uint8_t edata[DESFIRE_MAX_CRYPTO_BLOCK_SIZE] = {0};
 
     switch (key->type) {
-        case T_DES:
+        case T_DES: {
             switch (operation) {
-                case MCO_ENCYPHER:
+                case MCO_ENCYPHER: {
                     //DES_ecb_encrypt ((DES_cblock *) data, (DES_cblock *) edata, &(key->ks1), DES_ENCRYPT);
                     des_encrypt(edata, data, key->data);
                     break;
-                case MCO_DECYPHER:
+                }
+                case MCO_DECYPHER:  {
                     //DES_ecb_encrypt ((DES_cblock *) data, (DES_cblock *) edata, &(key->ks1), DES_DECRYPT);
                     des_decrypt(edata, data, key->data);
                     break;
+                }
             }
             break;
-        case T_3DES:
+        }
+        case T_3DES: {
             switch (operation) {
-                case MCO_ENCYPHER:
+                case MCO_ENCYPHER: {
                     mbedtls_des3_set2key_enc(&ctx3, key->data);
                     mbedtls_des3_crypt_ecb(&ctx3, data, edata);
                     // DES_ecb_encrypt ((DES_cblock *) data,  (DES_cblock *) edata, &(key->ks1), DES_ENCRYPT);
                     // DES_ecb_encrypt ((DES_cblock *) edata, (DES_cblock *) data,  &(key->ks2), DES_DECRYPT);
                     // DES_ecb_encrypt ((DES_cblock *) data,  (DES_cblock *) edata, &(key->ks1), DES_ENCRYPT);
                     break;
-                case MCO_DECYPHER:
+                }
+                case MCO_DECYPHER: {
                     mbedtls_des3_set2key_dec(&ctx3, key->data);
                     mbedtls_des3_crypt_ecb(&ctx3, data, edata);
                     // DES_ecb_encrypt ((DES_cblock *) data,  (DES_cblock *) edata, &(key->ks1), DES_DECRYPT);
                     // DES_ecb_encrypt ((DES_cblock *) edata, (DES_cblock *) data,  &(key->ks2), DES_ENCRYPT);
                     // DES_ecb_encrypt ((DES_cblock *) data,  (DES_cblock *) edata, &(key->ks1), DES_DECRYPT);
                     break;
+                }
             }
             break;
-        case T_3K3DES:
+        }
+        case T_3K3DES: {
             switch (operation) {
-                case MCO_ENCYPHER:
+                case MCO_ENCYPHER: {
                     mbedtls_des3_set3key_enc(&ctx3, key->data);
                     mbedtls_des3_crypt_ecb(&ctx3, data, edata);
                     // DES_ecb_encrypt ((DES_cblock *) data,  (DES_cblock *) edata, &(key->ks1), DES_ENCRYPT);
                     // DES_ecb_encrypt ((DES_cblock *) edata, (DES_cblock *) data,  &(key->ks2), DES_DECRYPT);
                     // DES_ecb_encrypt ((DES_cblock *) data,  (DES_cblock *) edata, &(key->ks3), DES_ENCRYPT);
                     break;
-                case MCO_DECYPHER:
+                }
+                case MCO_DECYPHER: {
                     mbedtls_des3_set3key_dec(&ctx3, key->data);
                     mbedtls_des3_crypt_ecb(&ctx3, data, edata);
                     // DES_ecb_encrypt ((DES_cblock *) data,  (DES_cblock *) edata, &(key->ks3), DES_DECRYPT);
                     // DES_ecb_encrypt ((DES_cblock *) edata, (DES_cblock *) data,  &(key->ks2), DES_ENCRYPT);
                     // DES_ecb_encrypt ((DES_cblock *) data,  (DES_cblock *) edata, &(key->ks1), DES_DECRYPT);
                     break;
+                }
             }
             break;
-        case T_AES:
+        }
+        case T_AES: {
             switch (operation) {
                 case MCO_ENCYPHER: {
                     mbedtls_aes_init(&actx);
                     mbedtls_aes_setkey_enc(&actx, key->data, 128);
-                    mbedtls_aes_crypt_cbc(&actx, MBEDTLS_AES_ENCRYPT, sizeof(edata), ivect, data, edata);
+                    mbedtls_aes_crypt_ecb(&actx, MBEDTLS_AES_ENCRYPT, data, edata);
                     break;
                 }
                 case MCO_DECYPHER: {
                     mbedtls_aes_init(&actx);
                     mbedtls_aes_setkey_dec(&actx, key->data, 128);
-                    mbedtls_aes_crypt_cbc(&actx, MBEDTLS_AES_DECRYPT, sizeof(edata), ivect, edata, data);
+                    mbedtls_aes_crypt_ecb(&actx, MBEDTLS_AES_DECRYPT, data, edata);
                     break;
                 }
             }
             break;
+        }
     }
 
     memcpy(data, edata, block_size);
@@ -870,7 +925,7 @@ void mifare_cypher_single_block(desfirekey_t key, uint8_t *data, uint8_t *ivect,
     if (direction == MCD_SEND) {
         memcpy(ivect, data, block_size);
     } else {
-        xor(ivect, data, block_size);
+        xor(data, ivect, block_size);
         memcpy(ivect, ovect, block_size);
     }
 }

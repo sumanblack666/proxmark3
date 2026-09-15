@@ -221,7 +221,7 @@ static int CmdKeriReader(const char *Cmd) {
     do {
         lf_read(false, 10000);
         demodKeri(!cm);
-    } while (cm && !kbd_enter_pressed());
+    } while (cm && (kbd_enter_pressed() == false));
 
     return PM3_SUCCESS;
 }
@@ -244,8 +244,8 @@ static int CmdKeriClone(const char *Cmd) {
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
 
-    uint8_t keritype[2] = {'i'}; // default to internalid
-    int typeLen = sizeof(keritype);
+    uint8_t keritype[2] = {'i', 0}; // default to internalid
+    int typeLen = sizeof(keritype) - 1; // CLIGetStrWithReturn does not guarantee string to be null-terminated
     CLIGetStrWithReturn(ctx, 1, keritype, &typeLen);
 
     uint32_t fc = arg_get_int_def(ctx, 2, 0);
@@ -309,8 +309,8 @@ static int CmdKeriClone(const char *Cmd) {
         res = clone_t55xx_tag(blocks, ARRAYLEN(blocks));
     }
 
-    PrintAndLogEx(SUCCESS, "Done");
-    PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf keri read`") " to verify");
+    PrintAndLogEx(SUCCESS, "Done!");
+    PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`lf keri read`") " to verify");
     return res;
 }
 
@@ -346,6 +346,10 @@ static int CmdKeriSim(const char *Cmd) {
     PrintAndLogEx(SUCCESS, "Simulating KERI - Internal Id " _YELLOW_("%" PRIu64), internalid);
 
     lf_psksim_t *payload = calloc(1, sizeof(lf_psksim_t) + sizeof(bs));
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
     payload->carrier =  2;
     payload->invert = 0;
     payload->clock = 32;

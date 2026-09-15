@@ -18,8 +18,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <inttypes.h>
+#include <sys/stat.h>
+#include "time.h"
 #include "fpga.h"
 #include "lz4hc.h"
+
+int fileno(FILE *);
 
 #ifndef MIN
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
@@ -28,26 +32,44 @@
 static void usage(void) {
     fprintf(stdout, "Usage: fpga_compress <infile1> <infile2> ... <infile_n> <outfile>\n");
     fprintf(stdout, "          Combine n FPGA bitstream files and compress them into one.\n\n");
+    fprintf(stdout, "       fpga_compress -s <infile> <outfile>\n");
+    fprintf(stdout, "          Compress <infile> into ONE single LZ4 block. Used for the ARM .data section\n\n");
     fprintf(stdout, "       fpga_compress -v <infile1> <infile2> ... <infile_n> <outfile>\n");
     fprintf(stdout, "          Extract Version Information from FPGA bitstream files and write it to <outfile>\n\n");
     fprintf(stdout, "       fpga_compress -d <infile> <outfile(s)>\n");
     fprintf(stdout, "          Decompress <infile>. Write result to <outfile(s)>\n\n");
 }
 
+// feof() only reports true once a read has already run off the end, so a file
+// whose length is an exact multiple of FPGA_INTERLEAVE_SIZE still looks unfinished
+// after its last whole chunk.  That earned one more interleave round of pure
+// padding, which pushed total_size past the buffer and got the whole set rejected
+// as "too big" -- PM3ULTIMATE's bitstreams are exactly 243 * 288 bytes.
+// Peek one byte instead, so a file that has been read to its last byte counts as
+// finished right away.
 static bool all_feof(FILE *infile[], uint8_t num_infiles) {
     for (uint16_t i = 0; i < num_infiles; i++) {
-        if (!feof(infile[i])) {
-            return false;
+
+        if (feof(infile[i])) {
+            continue;
         }
+
+        int c = fgetc(infile[i]);
+        if (c == EOF) {
+            continue;
+        }
+
+        ungetc(c, infile[i]);
+        return false;
     }
     return true;
 }
 
-static int zlib_compress(FILE *infile[], uint8_t num_infiles, FILE *outfile) {
+static int zlib_compress(FILE *infile[], uint8_t num_infiles, FILE *outfile, bool single_block) {
 
     uint8_t *fpga_config = calloc(num_infiles * FPGA_CONFIG_SIZE, sizeof(uint8_t));
     if (fpga_config == NULL) {
-        fprintf(stderr, "failed to allocate memory");
+        fprintf(stderr, "Failed to allocate memory\n");
         return (EXIT_FAILURE);
     }
 
@@ -55,7 +77,12 @@ static int zlib_compress(FILE *infile[], uint8_t num_infiles, FILE *outfile) {
     uint32_t total_size = 0;
     do {
 
-        if (total_size > num_infiles * FPGA_CONFIG_SIZE) {
+        // Each round writes num_infiles * FPGA_INTERLEAVE_SIZE bytes, so ask whether
+        // that round fits rather than whether we have already filled the buffer.
+        // `>` alone let a round start with the buffer full and overrun it; `>=`
+        // rejected a set that exactly filled it, which is what the bitstreams of a
+        // platform sized to FPGA_CONFIG_SIZE do.
+        if (total_size + (num_infiles * FPGA_INTERLEAVE_SIZE) > num_infiles * FPGA_CONFIG_SIZE) {
             fprintf(stderr,
                     "Input files too big (total > %li bytes). These are probably not PM3 FPGA config files.\n"
                     , num_infiles * FPGA_CONFIG_SIZE
@@ -65,13 +92,23 @@ static int zlib_compress(FILE *infile[], uint8_t num_infiles, FILE *outfile) {
             return (EXIT_FAILURE);
         }
 
+        // Pad a bitstream that ran out mid chunk with zeroes, so total_size stays a
+        // whole number of FPGA_INTERLEAVE_SIZE chunks.  zlib_decompress() walks the
+        // output in whole chunks and drops a trailing partial one, so an unpadded
+        // stream comes back short - 42172 bytes of fpga_pm3_hf.bit returned as 39788.
+        //
+        // Not for "-s".  That is the .data section, and start.c sizes the
+        // decompression with __data_end__ - __data_start__.  Rounding .data up to a
+        // chunk boundary makes LZ4_decompress_safe() overrun that and return an
+        // error, which drops the firmware into the LED panic loop in
+        // uncompress_data_section().
         for (uint16_t j = 0; j < num_infiles; j++) {
             for (uint16_t k = 0; k < FPGA_INTERLEAVE_SIZE; k++) {
                 uint8_t c = (uint8_t)fgetc(infile[j]);
 
                 if (!feof(infile[j])) {
                     fpga_config[total_size++] = c;
-                } else if (num_infiles > 1) {
+                } else if (single_block == false) {
                     fpga_config[total_size++] = '\0';
                 }
             }
@@ -79,9 +116,25 @@ static int zlib_compress(FILE *infile[], uint8_t num_infiles, FILE *outfile) {
 
     } while (all_feof(infile, num_infiles) == false);
 
+    // Block size for the LZ4 stream.  Two very different consumers, told apart by the
+    // caller with "-s",  never by counting input files:
+    //
+    //  - default: the interleaved FPGA bitstreams.  armsrc decompresses them one
+    //    block at a time into a FPGA_RING_BUFFER_BYTES buffer taken from BigBuf
+    //    (see get_from_fpga_combined_stream()), so the block size must match.
+    //    This holds for a single bitstream too.  A HF-only build ( SKIP_LF,
+    //    SKIP_FELICA, SKIP_ISO15693 ) hands us just fpga_pm3_hf.bit and it still
+    //    has to come out in ring buffer sized blocks.
+    //
+    //  - "-s": the firmware's .data section.  start.c's uncompress_data_section()
+    //    reads ONE 4-byte length and does ONE LZ4_decompress_safe(), so this must
+    //    come out as a SINGLE block - it has no loop over blocks, and a short
+    //    result is not treated as an error, so a second block would silently leave
+    //    the tail of .data uninitialized.  That is why it gets its own, much
+    //    larger, block size and must not be tied to FPGA_RING_BUFFER_BYTES.
     uint32_t buffer_size = FPGA_RING_BUFFER_BYTES;
 
-    if (num_infiles == 1) {
+    if (single_block) {
         // 1M bytes for now
         buffer_size = 1024 * 1024;
     }
@@ -90,14 +143,14 @@ static int zlib_compress(FILE *infile[], uint8_t num_infiles, FILE *outfile) {
 
     char *outbuf = calloc(outsize_max, sizeof(char));
     if (outbuf == NULL) {
-        fprintf(stderr, "failed to allocate memory");
+        fprintf(stderr, "Failed to allocate memory\n");
         free(fpga_config);
         return (EXIT_FAILURE);
     }
 
     char *ring_buffer = calloc(buffer_size, sizeof(char));
     if (ring_buffer == NULL) {
-        fprintf(stderr, "failed to allocate memory");
+        fprintf(stderr, "Failed to allocate memory\n");
         free(outbuf);
         free(fpga_config);
         return (EXIT_FAILURE);
@@ -106,12 +159,24 @@ static int zlib_compress(FILE *infile[], uint8_t num_infiles, FILE *outfile) {
     LZ4_streamHC_t *lz4_streamhc = LZ4_createStreamHC();
     LZ4_resetStreamHC_fast(lz4_streamhc, LZ4HC_CLEVEL_MAX);
 
+    if (single_block && total_size > buffer_size) {
+        fprintf(stderr, "error: %u bytes does not fit in a single %u byte block, and start.c only decompresses one\n"
+                , total_size
+                , buffer_size
+               );
+        free(ring_buffer);
+        free(outbuf);
+        free(fpga_config);
+        LZ4_freeStreamHC(lz4_streamhc);
+        return (EXIT_FAILURE);
+    }
+
     int current_in = 0;
     int current_out = 0;
 
     while (current_in < total_size) {
 
-        int bytes_to_copy = MIN(FPGA_RING_BUFFER_BYTES, (total_size - current_in));
+        int bytes_to_copy = MIN(buffer_size, (total_size - current_in));
 
         memcpy(ring_buffer, fpga_config + current_in, bytes_to_copy);
 
@@ -354,6 +419,8 @@ static int FpgaGatherVersion(FILE *infile, char *infile_name, char *dst, int len
     for (uint16_t i = 0; i < FPGA_BITSTREAM_FIXED_HEADER_SIZE; i++) {
         if (fgetc(infile) != bitparse_fixed_header[i]) {
             fprintf(stderr, "Invalid FPGA file. Aborting...\n\n");
+            fprintf(stderr, "File: %s\n", infile_name);
+
             return (EXIT_FAILURE);
         }
     }
@@ -380,30 +447,22 @@ static int FpgaGatherVersion(FILE *infile, char *infile_name, char *dst, int len
         strncat(dst, tempstr, len - strlen(dst) - 1);
     }
 
-    strncat(dst, " ", len - strlen(dst) - 1);
-    if (bitparse_find_section(infile, 'c', &fpga_info_len)) {
-        for (uint32_t i = 0; i < fpga_info_len; i++) {
-            char c = (char)fgetc(infile);
-            if (i < sizeof(tempstr)) {
-                if (c == '/') c = '-';
-                if (c == ' ') c = '0';
-                tempstr[i] = c;
-            }
-        }
-        strncat(dst, tempstr, len - strlen(dst) - 1);
+    // Get file statistics to extract date and time via file timestamp
+    int fd = fileno(infile);
+    struct stat fileStat;
+
+    if (fstat(fd, &fileStat) == 0) {
+        struct tm *modTime = localtime(&fileStat.st_mtime);
+
+
+        char timeBuf[64];
+        snprintf(timeBuf, sizeof(timeBuf), " %02d-%02d-%04d %02d:%02d:%02d",
+                 modTime->tm_mday, modTime->tm_mon + 1, modTime->tm_year + 1900,
+                 modTime->tm_hour, modTime->tm_min, modTime->tm_sec);
+
+        strncat(dst, timeBuf, len - strlen(dst) - 1);
     }
 
-    if (bitparse_find_section(infile, 'd', &fpga_info_len)) {
-        strncat(dst, " ", len - strlen(dst) - 1);
-        for (uint32_t i = 0; i < fpga_info_len; i++) {
-            char c = (char)fgetc(infile);
-            if (i < sizeof(tempstr)) {
-                if (c == ' ') c = '0';
-                tempstr[i] = c;
-            }
-        }
-        strncat(dst, tempstr, len - strlen(dst) - 1);
-    }
     return 0;
 }
 
@@ -420,8 +479,9 @@ static void print_version_info_preamble(FILE *outfile, int num_infiles) {
     fprintf(outfile, "// This file is generated by fpga_compress. Don't edit!\n");
     fprintf(outfile, "//-----------------------------------------------------------------------------\n");
     fprintf(outfile, "\n\n");
+    fprintf(outfile, "#include \"fpga.h\"\n\n");
     fprintf(outfile, "const int g_fpga_bitstream_num = %d;\n", num_infiles);
-    fprintf(outfile, "const char *const g_fpga_version_information[%d] = {\n", num_infiles);
+    fprintf(outfile, "const FPGA_VERSION_INFORMATION g_fpga_version_information[%d] = {\n", num_infiles);
 }
 
 static int generate_fpga_version_info(FILE *infile[], char *infile_names[], int num_infiles, FILE *outfile) {
@@ -432,7 +492,19 @@ static int generate_fpga_version_info(FILE *infile[], char *infile_names[], int 
 
     for (int i = 0; i < num_infiles; i++) {
         FpgaGatherVersion(infile[i], infile_names[i], version_string, sizeof(version_string));
-        fprintf(outfile, "    \" %s\"", version_string);
+        fprintf(outfile, "    { \"%s\"", version_string);
+
+        if (!memcmp("fpga_pm3_lf.ncd", version_string, sizeof("fpga_pm3_lf.ncd") - 1))
+            fprintf(outfile, ", FPGA_BITSTREAM_LF }");
+        else if (!memcmp("fpga_pm3_hf_15.ncd", version_string, sizeof("fpga_pm3_hf_15.ncd") - 1))
+            fprintf(outfile, ", FPGA_BITSTREAM_HF_15 }");
+        else if (!memcmp("fpga_pm3_hf.ncd", version_string, sizeof("fpga_pm3_hf.ncd") - 1))
+            fprintf(outfile, ", FPGA_BITSTREAM_HF }");
+        else if (!memcmp("fpga_pm3_felica.ncd", version_string, sizeof("fpga_pm3_felica.ncd") - 1))
+            fprintf(outfile, ", FPGA_BITSTREAM_HF_FELICA }");
+        else
+            fprintf(outfile, ", FPGA_BITSTREAM_UNKNOWN }");
+
         if (i != num_infiles - 1) {
             fprintf(outfile, ",");
         }
@@ -458,6 +530,12 @@ int main(int argc, char **argv) {
         uint8_t num_output_files = argc - 3;
         FILE **outfiles = calloc(num_output_files, sizeof(FILE *));
         char **outfile_names = calloc(num_output_files, sizeof(char *));
+        if (outfiles == NULL || outfile_names == NULL) {
+            fprintf(stderr, "Failed to allocate memory\n\n");
+            free(outfiles);
+            free(outfile_names);
+            return (EXIT_FAILURE);
+        }
         for (uint8_t i = 0; i < num_output_files; i++) {
             outfile_names[i] = argv[i + 3];
             outfiles[i] = fopen(outfile_names[i], "wb");
@@ -505,18 +583,42 @@ int main(int argc, char **argv) {
     } else { // Compress or generate version info
 
         bool generate_version_file = false;
+        bool single_block = false;
         uint8_t num_input_files = 0;
+        uint8_t first_input_file = 1;
+
         if (!strcmp(argv[1], "-v")) {  // generate version info
             generate_version_file = true;
+            first_input_file = 2;
+            num_input_files = argc - 3;
+        } else if (!strcmp(argv[1], "-s")) {  // compress one file into a single block
+            single_block = true;
+            first_input_file = 2;
             num_input_files = argc - 3;
         } else {  // compress 1..n fpga files
             num_input_files = argc - 2;
         }
 
+        if (num_input_files == 0) {
+            usage();
+            return (EXIT_FAILURE);
+        }
+
+        if (single_block && num_input_files != 1) {
+            fprintf(stderr, "Error. -s takes exactly one input file\n\n");
+            return (EXIT_FAILURE);
+        }
+
         FILE **infiles = calloc(num_input_files, sizeof(FILE *));
         char **infile_names = calloc(num_input_files, sizeof(char *));
+        if (infiles == NULL || infile_names == NULL) {
+            fprintf(stderr, "Failed to allocate memory\n\n");
+            free(infile_names);
+            free(infiles);
+            return (EXIT_FAILURE);
+        }
         for (uint8_t i = 0; i < num_input_files; i++) {
-            infile_names[i] = argv[i + (generate_version_file ? 2 : 1)];
+            infile_names[i] = argv[i + first_input_file];
             infiles[i] = fopen(infile_names[i], "rb");
             if (infiles[i] == NULL) {
                 fprintf(stderr, "Error. Cannot open input file %s\n\n", infile_names[i]);
@@ -544,7 +646,7 @@ int main(int argc, char **argv) {
         if (generate_version_file) {
             ret = generate_fpga_version_info(infiles, infile_names, num_input_files, outfile);
         } else {
-            ret = zlib_compress(infiles, num_input_files, outfile);
+            ret = zlib_compress(infiles, num_input_files, outfile, single_block);
         }
 
         // close file handlers

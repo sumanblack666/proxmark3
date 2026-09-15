@@ -152,7 +152,7 @@ static int CmdJablotronReader(const char *Cmd) {
     do {
         lf_read(false, 16000);
         demodJablotron(!cm);
-    } while (cm && !kbd_enter_pressed());
+    } while (cm && (kbd_enter_pressed() == false));
 
     return PM3_SUCCESS;
 }
@@ -240,8 +240,8 @@ static int CmdJablotronClone(const char *Cmd) {
     } else {
         res = clone_t55xx_tag(blocks, ARRAYLEN(blocks));
     }
-    PrintAndLogEx(SUCCESS, "Done");
-    PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf jablotron reader`") " to verify");
+    PrintAndLogEx(SUCCESS, "Done!");
+    PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`lf jablotron reader`") " to verify");
     return res;
 }
 
@@ -284,6 +284,11 @@ static int CmdJablotronSim(const char *Cmd) {
     getJablotronBits(fullcode, bs);
 
     lf_asksim_t *payload = calloc(1, sizeof(lf_asksim_t) + JABLOTRON_ARR_LEN);
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        free(bs);
+        return PM3_EMALLOC;
+    }
     payload->encoding =  2;
     payload->invert = 1;
     payload->separator = 0;

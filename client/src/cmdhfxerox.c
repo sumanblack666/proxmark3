@@ -593,7 +593,7 @@ int read_xerox_uid(bool loop, bool verbose) {
             return PM3_ESOFT;
         }
 
-    } while (loop && kbd_enter_pressed() == false);
+    } while (loop && (kbd_enter_pressed() == false));
 
     return PM3_SUCCESS;
 }
@@ -635,7 +635,7 @@ static int read_xerox_block(iso14b_card_select_t *card, uint8_t blockno, uint8_t
     uint8_t approx_len = (2 + card->uidlen + 1);
     iso14b_raw_cmd_t *packet = (iso14b_raw_cmd_t *)calloc(1, sizeof(iso14b_raw_cmd_t) + approx_len);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -952,6 +952,19 @@ static int CmdHFXeroxView(const char *Cmd) {
         return res;
     }
 
+    uint8_t info_max_block = 0;
+    for (uint8_t i = 0; i < ARRAYLEN(info_blocks); i++) {
+        if (info_blocks[i] > info_max_block) {
+            info_max_block = info_blocks[i];
+        }
+    }
+    size_t info_min = (info_max_block + 1) * XEROX_BLOCK_SIZE;
+    if (bytes_read < info_min) {
+        PrintAndLogEx(FAILED, "Error, dump file is too small to be a valid Xerox dump - bytes: %zu, expected at least: %zu", bytes_read, info_min);
+        free(dump);
+        return PM3_EFILE;
+    }
+
     uint16_t blockno = bytes_read / XEROX_BLOCK_SIZE;
 
     if (verbose) {
@@ -1013,8 +1026,8 @@ static int CmdHFXeroxRdBl(const char *Cmd) {
 static command_t CommandTable[] = {
     {"help",      CmdHelp,           AlwaysAvailable, "This help"},
     {"list",      CmdHFXeroxList,    AlwaysAvailable, "List ISO-14443B history"},
-    {"--------",  CmdHelp,           AlwaysAvailable, "----------------------- " _CYAN_("General") " -----------------------"},
-    {"info",      CmdHFXeroxInfo,    IfPm3Iso14443b,  "Short info on Fuji/Xerox tag"},
+    {"--------",  CmdHelp,           AlwaysAvailable, "----------------------- " _CYAN_("Operations") " -----------------------"},
+    {"info",      CmdHFXeroxInfo,    IfPm3Iso14443b,  "Tag information"},
     {"dump",      CmdHFXeroxDump,    IfPm3Iso14443b,  "Read all memory pages of an Fuji/Xerox tag, save to file"},
     {"reader",    CmdHFXeroxReader,  IfPm3Iso14443b,  "Act like a Fuji/Xerox reader"},
     {"view",      CmdHFXeroxView,    AlwaysAvailable, "Display content from tag dump file"},

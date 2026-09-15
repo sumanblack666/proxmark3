@@ -80,7 +80,7 @@ static int CmdHFCryptoRFSim(const char *Cmd) {
 static int CmdHFCryptoRFSniff(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf cryptorf sniff",
-                  "Sniff the communication reader and tag",
+                  "Sniff the communication between reader and tag",
                   "hf cryptorf sniff\n"
                  );
 
@@ -96,15 +96,16 @@ static int CmdHFCryptoRFSniff(const char *Cmd) {
     PacketResponseNG resp;
     WaitForResponse(CMD_HF_ISO14443B_SNIFF, &resp);
 
-    PrintAndLogEx(HINT, "Try `" _YELLOW_("hf cryptorf list") "` to view captured tracelog");
-    PrintAndLogEx(HINT, "Try `" _YELLOW_("trace save -f hf_cryptorf_mytrace") "` to save tracelog for later analysing");
+    PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf cryptorf list") "` to view captured tracelog");
+    PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("trace save -f hf_cryptorf_mytrace") "` to save tracelog for later analysing");
     return PM3_SUCCESS;
 }
 
 static bool get_14b_UID(iso14b_card_select_t *card) {
 
-    if (card == NULL)
+    if (card == NULL) {
         return false;
+    }
 
     int8_t retry = 3;
     while (retry--) {
@@ -126,7 +127,7 @@ static bool get_14b_UID(iso14b_card_select_t *card) {
     } // retry
 
     if (retry <= 0) {
-        PrintAndLogEx(FAILED, "command execution timeout");
+        PrintAndLogEx(FAILED, "command execution time out");
     }
 
     return false;
@@ -145,7 +146,7 @@ static int infoHFCryptoRF(bool verbose) {
     PacketResponseNG resp;
     if (WaitForResponseTimeout(CMD_HF_ISO14443B_COMMAND, &resp, TIMEOUT) == false) {
         if (verbose) {
-            PrintAndLogEx(WARNING, "command execution timeout");
+            PrintAndLogEx(WARNING, "command execution time out");
         }
         switch_off_field_cryptorf();
         return false;
@@ -208,7 +209,7 @@ int readHFCryptoRF(bool loop, bool verbose) {
         clearCommandBuffer();
         SendCommandNG(CMD_HF_ISO14443B_COMMAND, (uint8_t *)&packet, sizeof(iso14b_raw_cmd_t));
         PacketResponseNG resp;
-        if (WaitForResponseTimeout(CMD_ACK, &resp, 2000)) {
+        if (WaitForResponseTimeout(CMD_HF_ISO14443B_COMMAND, &resp, 2000)) {
 
             if (loop) {
                 if (resp.status != PM3_SUCCESS) {
@@ -231,8 +232,7 @@ int readHFCryptoRF(bool loop, bool verbose) {
             PrintAndLogEx(SUCCESS, " UID: " _GREEN_("%s"), sprint_hex_inrow(card.uid, card.uidlen));
             set_last_known_card(card);
         }
-    } while (loop && kbd_enter_pressed() == false);
-
+    } while (loop && (kbd_enter_pressed() == false));
     DropField();
     return res;
 }
@@ -311,7 +311,7 @@ static int CmdHFCryptoRFDump(const char *Cmd) {
     // select tag
     iso14b_raw_cmd_t *packet = (iso14b_raw_cmd_t *)calloc(1, sizeof(iso14b_raw_cmd_t) + 2);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
     packet->flags = (ISO14B_CONNECT | ISO14B_SELECT_SR);
@@ -445,7 +445,7 @@ static int CmdHFCryptoRFELoad(const char *Cmd) {
     // set up buffer
     uint8_t *data = calloc(datalen, sizeof(uint8_t));
     if (data == NULL) {
-        PrintAndLogEx(WARNING, "Fail, cannot allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -455,27 +455,13 @@ static int CmdHFCryptoRFELoad(const char *Cmd) {
         return PM3_EFILE;
     }
 
-    PrintAndLogEx(SUCCESS, "Uploading to emulator memory");
+    // ICEMAN: Once we have CryptoRF dump files, we can implement an upload
+    PrintAndLogEx(INFO, "to be implemented");
+    //PrintAndLogEx(SUCCESS, "Uploading to emulator memory");
+    //uint32_t bytes_sent = 0;
 
-    uint32_t bytes_sent = 0;
-    /*
-    //Send to device
-    uint32_t bytes_remaining  = bytes_read;
-
-    while (bytes_remaining > 0) {
-        uint32_t bytes_in_packet = MIN(PM3_CMD_DATA_SIZE, bytes_remaining);
-        if (bytes_in_packet == bytes_remaining) {
-            // Disable fast mode on last packet
-            g_conn.block_after_ACK = false;
-        }
-        clearCommandBuffer();
-        SendCommandMIX(CMD_HF_CRYPTORF_EML_MEMSET, bytes_sent, bytes_in_packet, 0, data + bytes_sent, bytes_in_packet);
-        bytes_remaining -= bytes_in_packet;
-        bytes_sent += bytes_in_packet;
-    }
-    */
     free(data);
-    PrintAndLogEx(SUCCESS, "sent " _YELLOW_("%d") " bytes of data to device emulator memory", bytes_sent);
+    //PrintAndLogEx(SUCCESS, "sent " _YELLOW_("%d") " bytes of data to device emulator memory", bytes_sent);
     return PM3_SUCCESS;
 }
 
@@ -505,7 +491,7 @@ static int CmdHFCryptoRFESave(const char *Cmd) {
     // set up buffer
     uint8_t *data = calloc(numofbytes, sizeof(uint8_t));
     if (data == NULL) {
-        PrintAndLogEx(WARNING, "Fail, cannot allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 

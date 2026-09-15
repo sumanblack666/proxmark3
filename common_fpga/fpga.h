@@ -25,15 +25,47 @@
 #if defined XC3
 #define FPGA_TYPE "3s100evq100"
 #define FPGA_CONFIG_SIZE                    72864L  // FPGA .bit file rounded up to next multiple of FPGA_INTERLEAVE_SIZE
+#elif defined XC2S50
+#define FPGA_TYPE "2s50vq144"
+#define FPGA_CONFIG_SIZE                    69984L  // FPGA .bit file rounded up to next multiple of FPGA_INTERLEAVE_SIZE
 #else
 #define FPGA_TYPE "2s30vq100"
 #define FPGA_CONFIG_SIZE                    42336L  // FPGA .bit file rounded up to next multiple of FPGA_INTERLEAVE_SIZE
 #endif
-#define FPGA_RING_BUFFER_BYTES              (1024 * 30)
+// LZ4 sliding-window / staging size for ONE compressed block, not the image:
+// fpga_compress chops the interleaved bitstreams into blocks of at most this
+// size, and the ARM decompresses them one at a time while DownloadFPGA() shifts
+// the bytes out to the FPGA.  It is allocated out of BigBuf, which on AT91 is
+// only ~31-33 kB, so 30 kB left nothing for the caller.
+// Smaller window = slightly worse compression
+// Measured on flash:
+//     30 kB -> 102555 bytes
+//     16 kB -> 107121 bytes
+// This does NOT bound the firmware's .data section
+// fpga_compress -s gives the .data section its own 1 MB block, because start.c only decompresses one.
+// Every FPGA bitstream, even a lone one in a HF only build, is chopped at this size.
+#define FPGA_RING_BUFFER_BYTES              (1024 * 16)
 #define FPGA_TRACE_SIZE                     3072
+
+// definitions for multiple FPGA config files support
+typedef enum {
+    FPGA_BITSTREAM_UNKNOWN = 0,
+    FPGA_BITSTREAM_LF = 1,
+    FPGA_BITSTREAM_MIN = FPGA_BITSTREAM_LF,
+    FPGA_BITSTREAM_HF,
+    FPGA_BITSTREAM_HF_FELICA,
+    FPGA_BITSTREAM_HF_15,
+    FPGA_BITSTREAM_MAX = FPGA_BITSTREAM_HF_15,
+    FPGA_CONFIG_COUNT
+} FPGA_config;
+
+typedef struct {
+    const char *const versionString;
+    const FPGA_config target_config;
+} FPGA_VERSION_INFORMATION;
 
 static const uint8_t bitparse_fixed_header[] = {0x00, 0x09, 0x0f, 0xf0, 0x0f, 0xf0, 0x0f, 0xf0, 0x0f, 0xf0, 0x00, 0x00, 0x01};
 extern const int g_fpga_bitstream_num;
-extern const char *const g_fpga_version_information[];
+extern const FPGA_VERSION_INFORMATION g_fpga_version_information[];
 
 #endif

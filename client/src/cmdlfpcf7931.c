@@ -44,7 +44,7 @@ int pcf7931_resetConfig(void) {
     configPcf.OffsetWidth = PCF7931_DEFAULT_OFFSET_WIDTH;
     configPcf.OffsetPosition = PCF7931_DEFAULT_OFFSET_POSITION;
     PrintAndLogEx(INFO, "Configuration reset");
-    PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf pcf7931 config`") " to view current settings");
+    PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("lf pcf7931 config") "` to view current settings");
     return PM3_SUCCESS;
 }
 
@@ -80,11 +80,11 @@ static int CmdLFPCF7931Reader(const char *Cmd) {
         PacketResponseNG resp;
         clearCommandBuffer();
         SendCommandNG(CMD_LF_PCF7931_READ, NULL, 0);
-        if (WaitForResponseTimeout(CMD_ACK, &resp, 2500) == false) {
+        if (WaitForResponseTimeout(CMD_LF_PCF7931_READ, &resp, 2500) == false) {
             PrintAndLogEx(WARNING, "command execution time out");
             return PM3_ETIMEOUT;
         }
-    } while (cm && !kbd_enter_pressed());
+    } while (cm && (kbd_enter_pressed() == false));
 
     return PM3_SUCCESS;
 }
@@ -105,8 +105,8 @@ static int CmdLFPCF7931Config(const char *Cmd) {
         arg_lit0("r", "reset", "Reset configuration to default values"),
         arg_str0("p", "pwd", "<hex>", "Password, 7bytes, LSB-order"),
         arg_u64_0("d", "delay", "<dec>", "Tag initialization delay (in us)"),
-        arg_int0(NULL, "lw", "<dec>", "offset, low pulses width (in us)"),
-        arg_int0(NULL, "lp", "<dec>", "offset, low pulses position (in us)"),
+        arg_int0(NULL, "lw", "<dec>", "offset, low pulses width (in us), optional!"),
+        arg_int0(NULL, "lp", "<dec>", "offset, low pulses position (in us), optional!"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -184,17 +184,27 @@ static int CmdLFPCF7931Write(const char *Cmd) {
 
     PrintAndLogEx(INFO, "Writing block %u at idx %u with data 0x%02X", block, idx, data[0]);
 
-    uint32_t buf[10]; // TODO sparse struct, 7 *bytes* then words at offset 4*7!
-    memcpy(buf, configPcf.Pwd, sizeof(configPcf.Pwd));
-    buf[7] = (configPcf.OffsetWidth + 128);
-    buf[8] = (configPcf.OffsetPosition + 128);
-    buf[9] = configPcf.InitDelay;
+    pcf7931_write_t payload = {
+        .offset_width = (uint8_t)(configPcf.OffsetWidth + 128),
+        .offset_position = (uint8_t)(configPcf.OffsetPosition + 128),
+        .init_delay = configPcf.InitDelay,
+        .address = block,
+        .byte = idx,
+        .data = data[0],
+    };
+    memcpy(payload.pwd, configPcf.Pwd, sizeof(payload.pwd));
 
     clearCommandBuffer();
-    SendCommandMIX(CMD_LF_PCF7931_WRITE, block, idx, data[0], buf, sizeof(buf));
+    SendCommandNG(CMD_LF_PCF7931_WRITE, (uint8_t *)&payload, sizeof(payload));
 
-    PrintAndLogEx(SUCCESS, "Done");
-    PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf pcf7931 reader`") " to verify");
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_LF_PCF7931_WRITE, &resp, 4000) == false) {
+        PrintAndLogEx(WARNING, "timeout while waiting for reply");
+        return PM3_ETIMEOUT;
+    }
+
+    PrintAndLogEx(SUCCESS, "Done!");
+    PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`lf pcf7931 reader`") " to verify");
     return PM3_SUCCESS;
 }
 

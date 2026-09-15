@@ -21,10 +21,11 @@
 #include "standalone.h"
 #include "proxmark3_arm.h"
 #include "appmain.h"
-#include "fpgaloader.h"
+#include "fpga_apis.h"
+#include "fpga_loader.h"
 #include "util.h"
 #include "dbprint.h"
-#include "ticks.h"
+#include "ticks_apis.h"
 #include "string.h"
 #include "BigBuf.h"
 #include "iso14443a.h"
@@ -79,13 +80,8 @@ void RunMod(void) {
                 }
             } else if (state == STATE_EMUL) {
                 uint16_t flags = 0;
-                if (card.uidlen == 4) {
-                    flags |= FLAG_4B_UID_IN_DATA;
-                } else if (card.uidlen == 7) {
-                    flags |= FLAG_7B_UID_IN_DATA;
-                } else if (card.uidlen == 10) {
-                    flags |= FLAG_10B_UID_IN_DATA;
-                } else {
+                FLAG_SET_UID_IN_DATA(flags, card.uidlen);
+                if (IS_FLAG_UID_IN_EMUL(flags)) {
                     Dbprintf("Unusual UID length, something is wrong. Try again please.");
                     state = STATE_READ;
                     continue;

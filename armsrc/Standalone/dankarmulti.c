@@ -19,8 +19,9 @@
 #include "standalone.h" // standalone definitions
 #include "proxmark3_arm.h"
 #include "appmain.h"
-#include "fpgaloader.h"
-#include "ticks.h"
+#include "fpga_apis.h"
+#include "fpga_loader.h"
+#include "ticks_apis.h"
 #include "util.h"
 #include "dbprint.h"
 
@@ -106,13 +107,11 @@ END_MODE_LIST
  *  End mode list  *
  *******************/
 
-void update_mode(int selected);
-
 void ModInfo(void) {
     DbpString("  Multi standalone loader aka dankarmulti (Daniel Karling)");
 }
 
-void update_mode(int selected) {
+static void update_mode(int selected) {
     if (selected >= NUM_MODES) {
         SpinDown(100);
         Dbprintf("Invalid mode selected");

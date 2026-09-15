@@ -120,12 +120,16 @@ static int derive_app_key(uint8_t *uid, uint8_t *app_key) {
 }
 
 // Might miss payload..
-static int diversify_mifare_key(const uint8_t *uid, uint8_t *app_key) {
+static int diversify_mifare_key(const uint8_t *uid, uint8_t *app_key, uint8_t app_keylen) {
     if (uid == NULL || app_key == NULL) {
         return PM3_EINVARG;
     }
 
-    uint8_t input[8];
+    if (app_keylen > AES_KEY_LEN) {
+        return PM3_EINVARG;
+    }
+
+    uint8_t input[AES_KEY_LEN];
     memcpy(input, uid, 4);
 
     uint32_t big = bytes_to_num(uid, 4);
@@ -143,12 +147,12 @@ static int diversify_mifare_key(const uint8_t *uid, uint8_t *app_key) {
         return PM3_ESOFT;
     }
 
-    uint8_t output[8];
+    uint8_t output[AES_KEY_LEN];
     if (mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, sizeof(input), iv, input, output)) {
         return PM3_ESOFT;
     }
     mbedtls_aes_free(&aes);
-    memcpy(app_key, output, sizeof(output));
+    memcpy(app_key, output, app_keylen);
     return PM3_SUCCESS;
 }
 
@@ -161,7 +165,7 @@ static int decrypt_card_sector(uint8_t *uid, const uint8_t *sector_data, uint8_t
     memcpy(input, sector_data, len);
 
     uint8_t key[AES_KEY_LEN];
-    diversify_mifare_key(uid, key);
+    diversify_mifare_key(uid, key, sizeof(key));
 
     uint8_t iv[16] = {0};
     mbedtls_aes_context aes;
@@ -186,7 +190,7 @@ static int derive_mifare_key(uint8_t *uid, const uint8_t *base_key, uint8_t *app
     }
 
     uint8_t diverse[MIFARE_KEY_SIZE];
-    diversify_mifare_key(uid, diverse);
+    diversify_mifare_key(uid, diverse, sizeof(diverse));
 
     for (uint8_t i = 0; i < MIFARE_KEY_SIZE; i++) {
         app_key[i] = base_key[i] ^ diverse[i];
@@ -399,9 +403,10 @@ static int ict_select_card(iso14a_card_select_t *card) {
     }
 
     clearCommandBuffer();
-    SendCommandMIX(CMD_HF_ISO14443A_READER, ISO14A_CONNECT, 0, 0, NULL, 0);
+    SendIso14aReader(ISO14A_CONNECT | ISO14A_CLEARTRACE, NULL, 0);
     PacketResponseNG resp;
-    if (WaitForResponseTimeout(CMD_ACK, &resp, 2500) == false) {
+    uint8_t sel_408 = 0;
+    if (WaitForIso14aReply(&resp, 2500, NULL, &sel_408) == false) {
         return PM3_ESOFT;
     }
 
@@ -411,7 +416,7 @@ static int ict_select_card(iso14a_card_select_t *card) {
         2: OK, no ATS
         3: proprietary Anticollision
     */
-    uint64_t select_status = resp.oldarg[0];
+    uint64_t select_status = sel_408;
     if (select_status == 0) {
         return PM3_ESOFT;
     }
@@ -516,12 +521,12 @@ static int CmdHfIctCredential(const char *Cmd) {
         uint16_t sc_size = mfNumBlocksPerSector(ICT_MIFARE_SECTOR) * MFBLOCK_SIZE;
         uint8_t *data = calloc(sc_size, sizeof(uint8_t));
         if (data == NULL) {
-            PrintAndLogEx(ERR, "failed to allocate memory");
+            PrintAndLogEx(WARNING, "Failed to allocate memory");
             return PM3_EMALLOC;
         }
 
         // diversified key A?
-        int res = mfReadSector(ICT_MIFARE_SECTOR, MF_KEY_A, ICT_MIFARE_A_KEY, data);
+        int res = mf_read_sector(ICT_MIFARE_SECTOR, MF_KEY_A, ICT_MIFARE_A_KEY, data);
         if (res != PM3_SUCCESS) {
             free(data);
             return res;

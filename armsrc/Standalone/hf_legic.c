@@ -21,10 +21,11 @@
 #include "proxmark3_arm.h"
 #include "BigBuf.h"
 #include "appmain.h"
-#include "fpgaloader.h"
+#include "fpga_apis.h"
+#include "fpga_loader.h"
 #include "util.h"
 #include "dbprint.h"
-#include "ticks.h"
+#include "ticks_apis.h"
 #include "legicrf.h"
 #include "legicrfsim.h"
 #include "legic.h"          // legic_card_select_t struct
@@ -69,16 +70,18 @@ static void save_dump_to_file(legic_card_select_t *p_card) {
     // legic functions puts it memory in Emulator reserved memory.
     uint8_t *mem = BigBuf_get_EM_addr();
 
-    char *preferredName = (char *)BigBuf_malloc(30);
+    char *preferredName = (char *)BigBuf_calloc(30);
     if (preferredName == NULL) {
+        if (g_dbglevel >= DBG_DEBUG) Dbprintf("Failed to allocate memory");
         goto OUT;
     }
 
     sprintf(preferredName, "hf-legic-%02X%02X%02X%02X-dump", p_card->uid[0], p_card->uid[1], p_card->uid[2], p_card->uid[3]);
     uint16_t preferredNameLen = strlen(preferredName);
 
-    char *filename = (char *)BigBuf_malloc(preferredNameLen + 4 + 1 + 10);
+    char *filename = (char *)BigBuf_calloc(preferredNameLen + 4 + 1 + 10);
     if (filename == NULL) {
+        if (g_dbglevel >= DBG_DEBUG) Dbprintf("Failed to allocate memory");
         goto OUT;
     }
 

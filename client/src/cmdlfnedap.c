@@ -296,7 +296,7 @@ static int CmdLFNedapReader(const char *Cmd) {
     do {
         lf_read(false, 16000);
         demodNedap(!cm);
-    } while (cm && !kbd_enter_pressed());
+    } while (cm && (kbd_enter_pressed() == false));
 
     return PM3_SUCCESS;
 }
@@ -472,8 +472,8 @@ static int CmdLFNedapClone(const char *Cmd) {
     } else {
         PrintAndLogEx(NORMAL, "");
     }
-    PrintAndLogEx(SUCCESS, "Done");
-    PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf nedap reader`") " to verify");
+    PrintAndLogEx(SUCCESS, "Done!");
+    PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`lf nedap reader`") " to verify");
     return res;
 }
 
@@ -539,6 +539,10 @@ static int CmdLFNedapSim(const char *Cmd) {
 
     // NEDAP,  Biphase = 2, clock 64, inverted,  (DIPhase == inverted BIphase)
     lf_asksim_t *payload = calloc(1, sizeof(lf_asksim_t) + g_DemodBufferLen);
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
     payload->encoding = 2;
     payload->invert = 1;
     payload->separator = 0;

@@ -39,14 +39,13 @@ void CodeIso15693AsReader(const uint8_t *cmd, int n);
 void CodeIso15693AsTag(const uint8_t *cmd, size_t len);
 
 void TransmitTo15693Reader(const uint8_t *cmd, size_t len, uint32_t *start_time, uint32_t slot_time, bool slow);
-int GetIso15693CommandFromReader(uint8_t *received, size_t max_len, uint32_t *eof_time);
+int GetIso15693CommandFromReader(uint8_t *received, size_t max_len, uint32_t *eof_time, bool allow_usb_interrupt);
 void TransmitTo15693Tag(const uint8_t *cmd, int len, uint32_t *start_time, bool shallow_mod);
 int GetIso15693AnswerFromTag(uint8_t *response, uint16_t max_len, uint16_t timeout, uint32_t *eof_time, bool fsk, bool recv_speed, uint16_t *resp_len);
 
 //void RecordRawAdcSamplesIso15693(void);
 void AcquireRawAdcSamplesIso15693(void);
 void ReaderIso15693(iso15_card_select_t *p_card); // ISO15693 reader
-void EmlClearIso15693(void);
 void SimTagIso15693(const uint8_t *uid, uint8_t block_size); // simulate an ISO15693 tag
 void BruteforceIso15693Afi(uint32_t flags); // find an AFI of a tag
 void SendRawCommand15693(iso15_raw_cmd_t *packet); // send arbitrary commands from CLI
@@ -69,4 +68,5 @@ void EnableEAS_AFISlixIso15693(const uint8_t *password, bool usepwd);
 void PassProtextEASSlixIso15693(const uint8_t *password);
 void PassProtectAFISlixIso15693(const uint8_t *password);
 void WriteAFIIso15693(const uint8_t *password, bool use_pwd, uint8_t *uid, bool use_uid, uint8_t afi);
+void ProtectPageSlixIso15693(const uint8_t *read_password, const uint8_t *write_password, uint8_t divide_ptr, uint8_t prot_status);
 #endif

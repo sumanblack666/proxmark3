@@ -34,8 +34,8 @@
 #include "crc32.h"
 #include "cmdhfmfdes.h"
 
-#define NTAG424_MAX_BYTES 412
-
+#define NTAG424_MAX_BYTES           412
+#define NTAG424_RESPONSE_LENGTH     2
 
 // NTAG424 commands currently implemented
 // icenam: should be able to use 14a / msdes to annotate NTAG424 communications
@@ -149,10 +149,40 @@ typedef struct {
 } ntag424_full_version_information_t;
 
 
-static void ntag424_print_version_information(ntag424_version_information_t *version) {
+static void ntag424_print_version_information(ntag424_version_information_t *version, bool is_hw) {
     PrintAndLogEx(INFO, "   vendor id: " _GREEN_("%02X"), version->vendor_id);
     PrintAndLogEx(INFO, "        type: " _GREEN_("%02X"), version->type);
-    PrintAndLogEx(INFO, "    sub type: " _GREEN_("%02X"), version->sub_type);
+
+    if (is_hw) {
+
+        const char *capacitance = "unknown";
+        switch (version->sub_type & 0xf) {
+            case 2: {
+                capacitance = "50pF";
+                break;
+            }
+            case 8: {
+                capacitance = "50pF + Tag Tamper";
+                break;
+            }
+        }
+
+        const char *modulation = "unknown";
+        switch ((version->sub_type >> 4) & 0xf) {
+            case 0: {
+                modulation = "strong";
+                break;
+            }
+            case 8: {
+                modulation = "standard";
+                break;
+            }
+        }
+        PrintAndLogEx(INFO, "    sub type: " _GREEN_("%02X (capacitance: %s, modulation: %s)"), version->sub_type, capacitance, modulation);
+
+    } else {
+        PrintAndLogEx(INFO, "    sub type: " _GREEN_("%02X"), version->sub_type);
+    }
     PrintAndLogEx(INFO, "     version: " _GREEN_("%d.%d"), version->major_version, version->minor_version);
     PrintAndLogEx(INFO, "storage size: " _GREEN_("%02X"), version->storage_size);
     PrintAndLogEx(INFO, "    protocol: " _GREEN_("%02X"), version->protocol);
@@ -168,10 +198,10 @@ static void ntag424_print_production_information(ntag424_production_information_
 
 static void ntag424_print_full_version_information(ntag424_full_version_information_t *version) {
     PrintAndLogEx(INFO, "--- " _CYAN_("Hardware version information:"));
-    ntag424_print_version_information(&version->hardware);
+    ntag424_print_version_information(&version->hardware, true);
 
     PrintAndLogEx(INFO, "--- " _CYAN_("Software version information:"));
-    ntag424_print_version_information(&version->software);
+    ntag424_print_version_information(&version->software, false);
 
     PrintAndLogEx(INFO, "--- " _CYAN_("Production information:"));
     ntag424_print_production_information(&version->production);
@@ -255,10 +285,6 @@ static int ntag424_calc_file_settings_size(const ntag424_file_settings_t *settin
     return size;
 }
 
-static int ntag424_calc_file_write_settings_size(const ntag424_file_settings_t *settings) {
-    return ntag424_calc_file_settings_size(settings) - 4;
-}
-
 static void ntag424_calc_send_iv(ntag424_session_keys_t *session_keys, uint8_t *out_ivc) {
     uint8_t iv_clear[] = { 0xa5, 0x5a,
                            session_keys->ti[0], session_keys->ti[1], session_keys->ti[2], session_keys->ti[3],
@@ -290,6 +316,10 @@ static void ntag424_calc_mac(const ntag424_session_keys_t *session_keys, uint8_t
     int mac_input_len = sizeof(mac_input_header) + datalen;
 
     uint8_t *mac_input = (uint8_t *)calloc(mac_input_len, sizeof(uint8_t));
+    if (mac_input == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return;
+    }
     memcpy(mac_input, mac_input_header, sizeof(mac_input_header));
     memcpy(&mac_input[sizeof(mac_input_header)], data, datalen);
     uint8_t mac[16] = {0};
@@ -446,21 +476,99 @@ static int ntag424_get_file_settings(uint8_t fileno, ntag424_file_settings_t *se
     return PM3_SUCCESS;
 }
 
+// Build the file settings command buffer dynamically.
+// This correctly handles conditional SDM offset fields per AN12196 specification.
+// Returns the number of bytes written to cmd_buffer (excluding fileno byte).
+static size_t ntag424_build_file_settings_cmd(const ntag424_file_settings_t *settings, uint8_t *cmd_buffer) {
+    size_t offset = 0;
+    int sdm_data_idx = 0;
+
+    // File options and access rights (always present)
+    cmd_buffer[offset++] = settings->options;
+    cmd_buffer[offset++] = settings->access[0];
+    cmd_buffer[offset++] = settings->access[1];
+
+    // SDM settings are only present if SDM is enabled
+    if (settings->options & FILE_SETTINGS_OPTIONS_SDM_AND_MIRRORING) {
+        // SDM options and access rights
+        cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_options;
+        cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_access[0];
+        cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_access[1];
+
+        uint8_t sdm_options = settings->optional_sdm_settings.sdm_options;
+        uint8_t sdm_meta_read = ntag424_file_settings_get_sdm_meta_read(settings);
+        uint8_t sdm_file_read = ntag424_file_settings_get_sdm_file_read(settings);
+
+        // UIDOffset: only in plain mode (sdmMetaRead == 0xE) with UID option set
+        if ((sdm_options & FILE_SETTINGS_SDM_OPTIONS_UID) && sdm_meta_read == 0x0e) {
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][0];
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][1];
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][2];
+            sdm_data_idx++;
+        }
+
+        // SDMReadCtrOffset: only in plain mode (sdmMetaRead == 0xE) with counter option set
+        if ((sdm_options & FILE_SETTINGS_SDM_OPTIONS_SDM_READ_COUNTER) && sdm_meta_read == 0x0e) {
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][0];
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][1];
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][2];
+            sdm_data_idx++;
+        }
+
+        // PICCDataOffset: only in encrypted mode (sdmMetaRead <= 0x04)
+        if (sdm_meta_read <= 0x04) {
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][0];
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][1];
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][2];
+            sdm_data_idx++;
+        }
+
+        // SDMMACInputOffset: when file read is enabled (sdmFileRead != 0x0F)
+        if (sdm_file_read != 0x0f) {
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][0];
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][1];
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][2];
+            sdm_data_idx++;
+
+            // SDMEncOffset and SDMEncLength: only when encrypted file data is enabled
+            if (sdm_options & FILE_SETTINGS_SDM_OPTIONS_SDM_ENC_FILE_DATA) {
+                // SDMEncOffset
+                cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][0];
+                cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][1];
+                cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][2];
+                sdm_data_idx++;
+                // SDMEncLength
+                cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][0];
+                cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][1];
+                cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][2];
+                sdm_data_idx++;
+            }
+
+            // SDMMACOffset: always included when file read is enabled
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][0];
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][1];
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][2];
+            sdm_data_idx++;
+        }
+
+        // SDMReadCtrLimit: when counter limit option is set
+        if (sdm_options & FILE_SETTINGS_SDM_OPTIONS_SDM_READ_COUNTER_LIMIT) {
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][0];
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][1];
+            cmd_buffer[offset++] = settings->optional_sdm_settings.sdm_data[sdm_data_idx][2];
+            sdm_data_idx++;
+        }
+    }
+
+    return offset;
+}
+
 static int ntag424_write_file_settings(uint8_t fileno, const ntag424_file_settings_t *settings, ntag424_session_keys_t *session_keys) {
 
-    // ------- Convert file settings to the format for writing
-    file_settings_write_t write_settings = {
-        .options = settings->options,
-        .access[0] = settings->access[0],
-        .access[1] = settings->access[1],
-        .optional_sdm_settings = settings->optional_sdm_settings,
-    };
-
-    size_t settings_size = ntag424_calc_file_write_settings_size(settings);
-
+    // Build the command buffer dynamically based on which SDM fields are required
     uint8_t cmd_buffer[256];
     cmd_buffer[0] = fileno;
-    memcpy(&cmd_buffer[1], &write_settings, settings_size);
+    size_t settings_size = ntag424_build_file_settings_cmd(settings, &cmd_buffer[1]);
 
     APDU_t apdu = {
         .cla = 0x90,
@@ -468,7 +576,6 @@ static int ntag424_write_file_settings(uint8_t fileno, const ntag424_file_settin
         .lc = 1 + settings_size,
         .data = cmd_buffer
     };
-
 
     // ------- Actually send the APDU
     int response_length = 8 + 2;
@@ -508,19 +615,17 @@ static void ntag424_print_file_settings(uint8_t fileno, const ntag424_file_setti
 
 // NTAG424 only have one static application, so we select it here
 static int ntag424_select_application(void) {
-    const size_t RESPONSE_LENGTH = 2;
     uint8_t cmd[] = {0x00, 0xA4, 0x04, 0x0C, 0x07, 0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01, 0x00 };
-    uint8_t resp[RESPONSE_LENGTH];
+    uint8_t resp[NTAG424_RESPONSE_LENGTH];
     int outlen = 0;
-    int res;
 
-    res = ExchangeAPDU14a(cmd, sizeof(cmd), false, true, resp, RESPONSE_LENGTH, &outlen);
+    int res = ExchangeAPDU14a(cmd, sizeof(cmd), false, true, resp, NTAG424_RESPONSE_LENGTH, &outlen);
     if (res != PM3_SUCCESS) {
         PrintAndLogEx(ERR, "Failed to send apdu");
         return res;
     }
 
-    if (outlen != RESPONSE_LENGTH || resp[RESPONSE_LENGTH - 2] != 0x90 || resp[RESPONSE_LENGTH - 1] != 0x00) {
+    if (outlen != NTAG424_RESPONSE_LENGTH || resp[NTAG424_RESPONSE_LENGTH - 2] != 0x90 || resp[NTAG424_RESPONSE_LENGTH - 1] != 0x00) {
         PrintAndLogEx(ERR, "Failed to select application");
         return PM3_ESOFT;
     }
@@ -728,7 +833,7 @@ static int ntag424_write_data(uint8_t fileno, uint32_t offset, uint32_t num_byte
 static int ntag424_read_data(uint8_t fileno, uint16_t offset, uint16_t num_bytes, uint8_t *out, ntag424_communication_mode_t comm_mode, ntag424_session_keys_t *session_keys) {
     uint8_t cmd_header[] = {
         fileno,
-        (uint8_t)offset, (uint8_t)(offset << 8), (uint8_t)(offset << 16), // offset
+        (uint8_t)offset, (uint8_t)(offset >> 8), (uint8_t)(offset >> 16), // offset
         (uint8_t)num_bytes, (uint8_t)(num_bytes >> 8), 0x00
     };
 
@@ -1018,7 +1123,7 @@ static int CmdHF_ntag424_read(const char *Cmd) {
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
 
-    int fileno = arg_get_int(ctx, 1);
+    int l_fileno = arg_get_int(ctx, 1);
 
     int keyno = 0;
     uint8_t key[16] = {0};
@@ -1067,10 +1172,10 @@ static int CmdHF_ntag424_read(const char *Cmd) {
     }
 
     uint8_t data[512] = {0};
-    res = ntag424_read_data(fileno, offset, read_length, data, comm_mode, &session_keys);
+    res = ntag424_read_data(l_fileno, offset, read_length, data, comm_mode, &session_keys);
     DropField();
     if (res == PM3_SUCCESS) {
-        PrintAndLogEx(SUCCESS, " -------- Read file " _YELLOW_("%d") " contents ------------ ", fileno);
+        PrintAndLogEx(SUCCESS, " -------- Read file " _YELLOW_("%d") " contents ------------ ", l_fileno);
         print_hex_break(data, read_length, 16);
     }
     return res;
@@ -1095,7 +1200,7 @@ static int CmdHF_ntag424_write(const char *Cmd) {
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
 
-    int fileno = arg_get_int(ctx, 1);
+    int l_fileno = arg_get_int(ctx, 1);
 
     int keyno = 0;
     uint8_t key[16] = {0};
@@ -1146,7 +1251,7 @@ static int CmdHF_ntag424_write(const char *Cmd) {
         }
     }
 
-    res = ntag424_write_data(fileno, offset, (uint32_t)datalen, data, comm_mode, &session_keys);
+    res = ntag424_write_data(l_fileno, offset, (uint32_t)datalen, data, comm_mode, &session_keys);
     DropField();
     if (res == PM3_SUCCESS) {
         PrintAndLogEx(SUCCESS, "Wrote " _YELLOW_("%d") " bytes ( " _GREEN_("ok") " )", datalen);
@@ -1168,7 +1273,7 @@ static int CmdHF_ntag424_getfilesettings(const char *Cmd) {
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
-    int fileno = arg_get_int(ctx, 1);
+    int l_fileno = arg_get_int(ctx, 1);
 
     CLIParserFree(ctx);
 
@@ -1184,10 +1289,10 @@ static int CmdHF_ntag424_getfilesettings(const char *Cmd) {
     }
 
     ntag424_file_settings_t settings = {0};
-    int res = ntag424_get_file_settings(fileno, &settings);
+    int res = ntag424_get_file_settings(l_fileno, &settings);
     DropField();
     if (res == PM3_SUCCESS) {
-        ntag424_print_file_settings(fileno, &settings);
+        ntag424_print_file_settings(l_fileno, &settings);
     }
     return res;
 }
@@ -1247,7 +1352,7 @@ static int CmdHF_ntag424_changefilesettings(const char *Cmd) {
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
-    int fileno = arg_get_int(ctx, 1);
+    int l_fileno = arg_get_int(ctx, 1);
 
     int keyno = 0;
     uint8_t key[16] = {0};
@@ -1339,7 +1444,7 @@ static int CmdHF_ntag424_changefilesettings(const char *Cmd) {
     }
 
     ntag424_file_settings_t settings = {0};
-    if (ntag424_get_file_settings(fileno, &settings) != PM3_SUCCESS) {
+    if (ntag424_get_file_settings(l_fileno, &settings) != PM3_SUCCESS) {
         DropField();
         return PM3_ESOFT;
     }
@@ -1377,11 +1482,11 @@ static int CmdHF_ntag424_changefilesettings(const char *Cmd) {
         settings.optional_sdm_settings.sdm_data[i][0] = sdm_data[i][2];
     }
 
-    res = ntag424_write_file_settings(fileno, &settings, &session);
+    res = ntag424_write_file_settings(l_fileno, &settings, &session);
     DropField();
     if (res == PM3_SUCCESS) {
         PrintAndLogEx(SUCCESS, "Write settings ( " _GREEN_("ok") " )");
-        ntag424_print_file_settings(fileno, &settings);
+        ntag424_print_file_settings(l_fileno, &settings);
     } else {
         PrintAndLogEx(ERR, "Write settings (" _RED_("fail") " )");
     }

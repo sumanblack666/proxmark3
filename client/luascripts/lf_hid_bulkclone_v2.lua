@@ -1,9 +1,10 @@
 local getopt = require('getopt')
+local ansicolors  = require('ansicolors')
 local cmds = require('commands')
 
 copyright = ''
 author = "TheChamop669"
-version = 'v1.0.0'
+version = 'v1.0.1'
 desc = [[
 Perform bulk enrollment of 26 bit H10301 style RFID Tags
 For more info, check the comments in the code
@@ -13,7 +14,7 @@ example = [[
     script run lf_hid_bulkclone_v2.lua -f 1 -b 1000
 ]]
 usage = [[
-script run lf_hid_bulkclone_v2.lua -f facility -b base_id_num 
+script run lf_hid_bulkclone_v2.lua -f facility -b base_id_num
 ]]
 arguments = [[
     -h      : this help
@@ -66,7 +67,7 @@ local function exitMsg(msg)
 end
 
 local function main(args)
-    
+
     print( string.rep('--',20) )
     print( string.rep('--',20) )
     print()
@@ -106,7 +107,7 @@ local function main(args)
 
         print("Press Enter to write the next card, type 'r' and press Enter to retry, or type 'q' and press Enter to quit.")
         local user_input = io.read()
-        
+
         if user_input:lower() == 'q' then
             print("Timestamp: ", timestamp)
             print("Successful Writes:")

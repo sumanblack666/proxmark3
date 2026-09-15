@@ -20,6 +20,7 @@
 #define CMDLFT55XX_H__
 
 #include "common.h"
+#include <stdbool.h>
 
 #define T55x7_CONFIGURATION_BLOCK       0x00
 #define T55x7_PWD_BLOCK                 0x07
@@ -43,6 +44,8 @@
 #define T55X7_SECURAKEY_CONFIG_BLOCK    0x000C8060  // ASK, Manchester, data rate 40, 3 data blocks
 #define T55X7_UNK_CONFIG_BLOCK          0x000880FA  // ASK, Manchester, data rate 32, 7 data blocks STT, Inverse ...
 #define T55X7_PYRONIX_CONFIG_BLOCK      0x00088C40  // ASK, Manchester, data rate 32, 2 data blocks
+#define T55X7_TEXECOM_CONFIG_BLOCK      0x001C8020  // ASK, Manchester, data rate 128, 1 data block
+#define T55X7_BETECH_CONFIG_BLOCK       0x001480E0  // ASK, Manchester, data rate 64, 7 data block
 
 // FDXB requires data inversion and BiPhase 57 is simply BiPhase 50 inverted, so we can either do it using the modulation scheme or the inversion flag
 // we've done both below to prove that it works either way, and the modulation value for BiPhase 50 in the Atmel data sheet of binary "10001" (17) is a typo,
@@ -156,6 +159,13 @@ typedef struct {
     } bitrate;
     bool Q5;
     bool ST;
+    int32_t anchor_sample;
+    int32_t anchor_tracelen;   // graph length it was taken on, so a loaded file
+    bool anchor_valid;         // anchor_sample came from a live demodulation
+    uint8_t psk_carrier;       // observed psk subcarrier in field clocks, 2/4/8. 0 = not measured
+    uint8_t broadcast_blocks;  // measured blocks per regular-read cycle. 0 = not measured
+    bool psk3_favoured;        // data blocks lean psk3, but do not settle it
+    bool pwd_known;            // usepwd below reflects a live detect, not a default
     bool usepwd;
     uint32_t pwd;
     enum {

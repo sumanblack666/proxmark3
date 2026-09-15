@@ -122,7 +122,7 @@
 #include "spiffs.h"
 #include "appmain.h"
 #include "dbprint.h"
-#include "ticks.h"
+#include "ticks_apis.h"
 #include "BigBuf.h"
 #include "string.h"
 
@@ -156,7 +156,7 @@ static void UniSniff_DownloadTraceInstructions(char *fn, const char *proto) {
 #endif
 
 void ModInfo(void) {
-    DbpString("  HF UNISNIFF - multimode HF sniffer (hazardousvoltage)");
+    DbpString("  HF UNISNIFF - multimode HF sniffer ( hazardousvoltage )");
     Dbprintf("  Compile-time default protocol... %s", HF_UNISNIFF_PROTOCOL);
 #ifdef WITH_FLASH
     DbpString("  FLASH support................... yes");
@@ -201,7 +201,7 @@ void RunMod(void) {
     // available after filling the trace buffer.
     char *filename = (char *)BigBuf_calloc(64);
     if (filename == NULL) {
-        Dbprintf("failed to allocate memory");
+        Dbprintf("Failed to allocate memory");
         return;
     }
     // Read the config file.  Size is limited to defined value so as not to consume

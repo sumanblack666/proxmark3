@@ -150,7 +150,7 @@ static int CmdNoralsyReader(const char *Cmd) {
     do {
         lf_read(false, 8000);
         demodNoralsy(!cm);
-    } while (cm && !kbd_enter_pressed());
+    } while (cm && (kbd_enter_pressed() == false));
     return PM3_SUCCESS;
 }
 
@@ -199,6 +199,10 @@ static int CmdNoralsyClone(const char *Cmd) {
     }
 
     uint8_t *bits = calloc(96, sizeof(uint8_t));
+    if (bits == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
     if (getnoralsyBits(id, year, bits) != PM3_SUCCESS) {
         PrintAndLogEx(ERR, "Error with tag bitstream generation.");
         free(bits);
@@ -220,8 +224,8 @@ static int CmdNoralsyClone(const char *Cmd) {
     } else {
         res = clone_t55xx_tag(blocks, ARRAYLEN(blocks));
     }
-    PrintAndLogEx(SUCCESS, "Done");
-    PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf noralsy reader`") " to verify");
+    PrintAndLogEx(SUCCESS, "Done!");
+    PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`lf noralsy reader`") " to verify");
     return res;
 }
 
@@ -257,6 +261,10 @@ static int CmdNoralsySim(const char *Cmd) {
     PrintAndLogEx(SUCCESS, "Simulating Noralsy - CardId: " _YELLOW_("%u") " year " _YELLOW_("%u"), id, year);
 
     lf_asksim_t *payload = calloc(1, sizeof(lf_asksim_t) + sizeof(bs));
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
     payload->encoding = 1;
     payload->invert = 0;
     payload->separator = 1;

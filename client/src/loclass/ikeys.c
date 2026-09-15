@@ -154,8 +154,7 @@ static uint64_t ck(int i, int j, uint64_t z) {
     if (getSixBitByte(z, i) == getSixBitByte(z, j)) {
         //ck(i, j − 1, z [0] . . . z [i] ← j . . . z [3] )
         uint64_t newz = 0;
-        int c;
-        for (c = 0; c < 4; c++) {
+        for (int c = 0; c < 4; c++) {
             uint8_t val = getSixBitByte(z, c);
             if (c == i)
                 pushbackSixBitByte(&newz, j, c);
@@ -201,22 +200,139 @@ static uint64_t check(uint64_t z) {
     return ck1 | ck2 >> 24;
 }
 
-static void permute(BitstreamIn_t *p_in, uint64_t z, int l, int r, BitstreamOut_t *out) {
-    if (bitsLeft(p_in) == 0)
-        return;
+// Reverse ck (scramble-1)
+//
+// ck() rewrites a repeated value as the *index* it matched, so a stored value in
+// 0..3 is ambiguous: it may be such a marker, or a genuine value that happens to
+// be small. The inverse therefore has to enumerate, not pick one reading.
+//
+// ck() reduces to: for i = 3, 2, 1 (in that order)
+//
+//     v = z[i];  for j = i-1 down to 0:  if (v == z[j]) v = j;   out[i] = v;
+//
+// where every z[j] on the right is still the *original* value, because z[j] is
+// only ever rewritten once j becomes the outer index, which happens later. So
+// out[i] depends solely on the original z[i] and z[0..i-1], and the halves can
+// be inverted index by index, resolving z[0], then z[1], and so on.
 
-    bool pn = tailBit(p_in);
-    if (pn) {
-        // pn = 1
-        uint8_t zl = getSixBitByte(z, l);
-        push6bits(out, zl + 1);
-        permute(p_in, z, l + 1, r, out);
-    } else {
-        // otherwise
-        uint8_t zr = getSixBitByte(z, r);
-        push6bits(out, zr);
-        permute(p_in, z, l, r + 1, out);
+#define CK_MAX_PREIMAGES  64
+
+// All v with:  v0 = v; for j = i-1 down to 0: if (v0 == zs[j]) v0 = j;  giving t.
+// Undoes the steps in reverse order, branching wherever both readings are possible.
+static int invert_ck_index(uint8_t t, const uint8_t *zs, int i, uint8_t *out, int max) {
+
+    uint8_t cur[CK_MAX_PREIMAGES] = {0};
+    uint8_t nxt[CK_MAX_PREIMAGES] = {0};
+
+    int n = 0;
+    int m;
+    cur[n++] = t;
+
+    for (int j = 0; j < i; j++) {
+        m = 0;
+        for (int a = 0; a < n; a++) {
+
+            uint8_t va = cur[a];
+
+            if (va == j) {                             // the substitution happened
+
+                uint8_t v = zs[j];
+                bool dup = false;
+
+                for (int d = 0; d < m; d++) {
+                    if (nxt[d] == v) {
+                        dup = true;
+                    }
+                }
+
+                if ((dup == false) && (m < CK_MAX_PREIMAGES)) {
+                    nxt[m++] = v;
+                }
+            }
+
+            if (va != zs[j]) {                         // no substitution at this step
+                bool dup = false;
+                for (int d = 0; d < m; d++) {
+                    if (nxt[d] == va) {
+                        dup = true;
+                    }
+                }
+
+                if ((dup == false) && (m < CK_MAX_PREIMAGES)) {
+                    nxt[m++] = va;
+                }
+            }
+        }
+        memcpy(cur, nxt, m);
+        n = m;
+        if (n == 0) {
+            break;
+        }
     }
+
+    int count = 0;
+    for (int a = 0; a < n && count < max; a++) {
+        if (cur[a] < 0x40) {
+            out[count++] = cur[a];
+        }
+    }
+    return count;
+}
+
+// Every four-value half that ck(3, 2, .) maps to o[]. Returns how many were written.
+static int invert_ck_half(const uint8_t o[4], uint8_t (*out)[4], int max) {
+    uint8_t c1[CK_MAX_PREIMAGES], c2[CK_MAX_PREIMAGES], c3[CK_MAX_PREIMAGES];
+    uint8_t zs[4];
+    int count = 0;
+
+    zs[0] = o[0];                                      // ck() never rewrites z[0]
+    int n1 = invert_ck_index(o[1], zs, 1, c1, CK_MAX_PREIMAGES);
+
+    for (int a = 0; a < n1 && count < max; a++) {
+        zs[1] = c1[a];
+        int n2 = invert_ck_index(o[2], zs, 2, c2, CK_MAX_PREIMAGES);
+
+        for (int b = 0; b < n2 && count < max; b++) {
+            zs[2] = c2[b];
+            int n3 = invert_ck_index(o[3], zs, 3, c3, CK_MAX_PREIMAGES);
+
+            for (int d = 0; d < n3 && count < max; d++) {
+                out[count][0] = zs[0];
+                out[count][1] = zs[1];
+                out[count][2] = zs[2];
+                out[count][3] = c3[d];
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+// Every zP that check() maps to z. The two halves are independent, so the result
+// is their cross product. Returns how many were written to out[].
+static int reverse_check_all(uint64_t z, uint64_t *out, int max) {
+    uint8_t h1[4], h2[4];
+    for (int n = 0; n < 4; n++) {
+        h1[n] = getSixBitByte(z, n);
+        h2[n] = getSixBitByte(z, n + 4);
+    }
+
+    uint8_t p1[CK_MAX_PREIMAGES][4], p2[CK_MAX_PREIMAGES][4];
+    int n1 = invert_ck_half(h1, p1, CK_MAX_PREIMAGES);
+    int n2 = invert_ck_half(h2, p2, CK_MAX_PREIMAGES);
+
+    int count = 0;
+    for (int a = 0; a < n1 && count < max; a++) {
+        for (int b = 0; b < n2 && count < max; b++) {
+            uint64_t zP = 0;
+            for (int n = 0; n < 4; n++) {
+                pushbackSixBitByte(&zP, p1[a][n], n);
+                pushbackSixBitByte(&zP, p2[b][n], n + 4);
+            }
+            out[count++] = zP;
+        }
+    }
+    return count;
 }
 
 static void printState(const char *desc, uint64_t c) {
@@ -235,6 +351,43 @@ static void printState(const char *desc, uint64_t c) {
         snprintf(s + strlen(s), sizeof(s) - strlen(s), " %02x", getSixBitByte(c, i));
 
     PrintAndLogEx(DEBUG, "%s", s);
+}
+
+static void permute(BitstreamIn_t *p_in, uint64_t z, int l, int r, BitstreamOut_t *out) {
+    if (bitsLeft(p_in) == 0)
+        return;
+    bool pn = tailBit(p_in);
+    if (pn) {
+        // pn = 1
+        uint8_t zl = getSixBitByte(z, l);
+        push6bits(out, zl + 1);
+        permute(p_in, z, l + 1, r, out);
+    } else {
+        // otherwise
+        uint8_t zr = getSixBitByte(z, r);
+        push6bits(out, zr);
+        permute(p_in, z, l, r + 1, out);
+    }
+}
+
+static void reverse_permute(BitstreamIn_t *p_in, uint64_t z, int l, BitstreamOut_t *out1, BitstreamOut_t *out2, bool fix) {
+    if (bitsLeft(p_in) == 0)
+        return;
+    bool pn = tailBit(p_in);
+    if (pn) { //if p == 1 for that six bit position, then sum it
+        // pn = 1
+        uint8_t zl = getSixBitByte(z, l);
+        if (fix) {
+            push6bits(out1, zl - 1);
+        } else {
+            push6bits(out1, zl);
+        }
+    } else {
+        // otherwise
+        uint8_t zr = getSixBitByte(z, l);
+        push6bits(out2, zr);
+    }
+    reverse_permute(p_in, z, l + 1, out1, out2, fix);
 }
 
 /**
@@ -339,6 +492,265 @@ void hash0(uint64_t c, uint8_t k[8]) {
         }
     }
 }
+
+static int find_p_in_pi(uint8_t p) {
+    for (int i = 0; i < 35; i++) {
+        if (pi[i] == p) {
+            return i;  // Value found
+        }
+    }
+    return -1;  // Value not found
+}
+
+//Reverse hash0
+void invert_hash0(uint8_t k[8]) {
+
+    uint8_t y = 0;
+    uint64_t zTilde = 0;
+    uint8_t p = 0;
+
+    for (int i = 0; i < 8; i++) {
+        y |= ((k[i] & 0x80) >> (7 - i)); // Recover the bit of y from the leftmost bit of k[i]
+        pushbackSixBitByte(&zTilde, (k[i] & 0x7E) >> 1, i); // Recover the six bits of zTilde from the middle of k[i]
+
+        if (g_debugMode > 0) printState("z~", zTilde);
+
+        p |= ((k[i] & 0x01) << i);
+    }
+
+    if (g_debugMode > 0) PrintAndLogEx(INFO, "        y : %02x", y); // value of y (recovered 1 byte of the pre-image)
+    // check if p is part of the array pi, if not invert it
+    if (g_debugMode > 0) PrintAndLogEx(INFO, "        p : %02x", p); // value of p (at some point in the original hash0)
+
+    int remainder = find_p_in_pi(p);
+    if (remainder < 0) {
+        p = ~p;
+        remainder = find_p_in_pi(p);
+    }
+
+    if (g_debugMode > 0) PrintAndLogEx(INFO, "  p or ~p : %02x", p); // value of p (at some point in the original hash0)
+
+    // find possible values of x that can return the same remainder
+    uint8_t x_count = 0;
+    uint8_t x_array[8];
+    for (int x = 0x00; x <= 0xFF; x++) {
+        if (x % 35 == remainder) {
+            x_array[x_count] = x;
+            x_count++;
+        }
+    }
+
+    uint8_t pre_image_base[8] = {0};
+    pre_image_base[1] = y;
+
+    // calculate pre-images based on the potential values of x. Sshould we use pre-flip p and post flip p just in case?
+    uint64_t zTil_img[8] = {0}; // 8 is the max size it'll have as per max number of X pre-images
+
+    for (int img = 0; img < x_count; img++) { // for each potential value of x calculate a pre-image
+
+        zTil_img[img] = zTilde;
+        pre_image_base[0] = x_array[img];
+
+        uint8_t pc = p; // redefine and reassociate it here or it'll keep changing through the loops
+        if (x_array[img] & 1) { // Check if potential x7 is 1, if it is then invert p
+            pc = ~p;
+        }
+
+        // calculate zTilde for the x preimage
+        for (int i = 0; i < 8; i++) {
+
+            uint8_t p_i = (pc >> i) & 0x1; // this is correct!
+            uint8_t zTilde_i = getSixBitByte(zTilde, i) << 1;
+
+            if (k[i] & 0x80) { // this checks the value of the first bit of the byte (value of y_i)
+                if (p_i) {
+                    zTilde_i--;
+                }
+                zTilde_i = ~zTilde_i; // flip the 6 bit string
+            } else {
+                zTilde_i |= p_i & 0x1;
+            }
+
+            pushbackSixBitByte(&zTil_img[img], zTilde_i >> 1, i);
+        }
+
+        if (g_debugMode > 0) {
+            PrintAndLogEx(INFO, _YELLOW_("Testing Pre-Image Base: %s"), sprint_hex(pre_image_base, sizeof(pre_image_base)));
+            PrintAndLogEx(DEBUG, "          | x| y|z0|z1|z2|z3|z4|z5|z6|z7|");
+            printState("0|0|z~", zTil_img[img]); // we retrieve the values of z~
+            PrintAndLogEx(INFO, "  p or ~p : %02x", pc); // value of p (at some point in the original hash0)
+        }
+
+        // reverse permute
+        BitstreamIn_t p_in = { &pc, 8, 0 };
+        uint8_t outbuffer_1[] = {0, 0, 0, 0, 0, 0, 0, 0};
+        uint8_t outbuffer_2[] = {0, 0, 0, 0, 0, 0, 0, 0};
+        BitstreamOut_t out_1 = {outbuffer_1, 0, 0};
+        BitstreamOut_t out_2 = {outbuffer_2, 0, 0};
+        reverse_permute(&p_in, zTil_img[img], 0, &out_1, &out_2, false); // sort the bits
+
+        // Shift z-values down onto the lower segment
+        uint64_t zCaret_1 = x_bytes_to_num(outbuffer_1, sizeof(outbuffer_1));
+        zCaret_1 >>= 16;
+        uint64_t zCaret_2 = x_bytes_to_num(outbuffer_2, sizeof(outbuffer_2));
+        zCaret_2 >>= 40;
+        uint64_t zCaret = zCaret_1 | zCaret_2;
+        if (g_debugMode > 0) printState("0|0|z^", zCaret);
+
+        // fix the bits values
+        uint8_t p_fix = 0x0F; // fix bits mask as the bits will be in 11110000 order
+        BitstreamIn_t p_in_f = { &p_fix, 8, 0 };
+        uint8_t outbuffer_f1[] = {0, 0, 0, 0, 0, 0, 0, 0};
+        uint8_t outbuffer_f2[] = {0, 0, 0, 0, 0, 0, 0, 0};
+        BitstreamOut_t out_f1 = {outbuffer_f1, 0, 0};
+        BitstreamOut_t out_f2 = {outbuffer_f2, 0, 0};
+        reverse_permute(&p_in_f, zCaret, 0, &out_f1, &out_f2, true); // fixes the bits accordingly
+
+        // Shift z-values down onto the lower segment
+        uint64_t zCaret_fixed1 = x_bytes_to_num(outbuffer_f1, sizeof(outbuffer_f1));
+        zCaret_fixed1 >>= 16;
+        uint64_t zCaret_fixed2 = x_bytes_to_num(outbuffer_f2, sizeof(outbuffer_f2));
+        zCaret_fixed2 >>= 40;
+
+        uint64_t zCaret_fixed = zCaret_fixed1 | zCaret_fixed2;
+        if (g_debugMode > 0) printState("0|0|z^", zCaret_fixed);
+
+        // check() is not injective either -- see reverse_check_all() -- so this
+        // yields every zP that maps to zCaret_fixed, and each is followed through.
+        uint64_t zP_list[CK_MAX_PREIMAGES];
+        int zP_count = reverse_check_all(zCaret_fixed, zP_list, CK_MAX_PREIMAGES);
+
+        for (int zp_i = 0; zp_i < zP_count; zp_i++) {
+
+            uint64_t zP = zP_list[zp_i];
+            if (g_debugMode > 0) printState("0|0|z'", zP);
+
+            // reverse the modulo transformation in the hash0 function for the six-bit chunks
+
+            uint64_t c = 0;
+
+            for (int n = 0; n < 4; n++) {
+                uint8_t _zn = getSixBitByte(zP, n);
+                uint8_t _zn4 = getSixBitByte(zP, n + 4);
+
+                uint8_t zn = (_zn + (63 - 2 * n)) % (63 - n);
+                uint8_t zn4 = (_zn4 + (64 - 2 * n)) % (64 - n);
+
+                pushbackSixBitByte(&c, zn, n);
+                pushbackSixBitByte(&c, zn4, n + 4);
+            }
+
+            // The Hydra: hash0() reduces every six-bit z chunk modulo a value that
+            // depends on the chunk position:
+            //
+            //     _zn  = (zn  % (63 - n)) + n         for n = 0..3
+            //     _zn4 = (zn4 % (64 - n)) + n         for n = 0..3  (chunks 4..7)
+            //
+            // Since the modulus is smaller than 0x40 the reduction is lossy, so a
+            // recovered residue r has a second pre-image at r + modulus whenever
+            // that value still fits in six bits. Each such chunk forks the search.
+
+            // Initialize an array of pointers to uint64_t (start with one value, initialized to 0)
+            uint64_t *hydra_heads = (uint64_t *)calloc(sizeof(uint64_t), 1); // Start with one uint64_t
+            if (hydra_heads == NULL) {
+                PrintAndLogEx(WARNING, "Failed to allocate memory");
+                return;
+            }
+            hydra_heads[0] = 0;  // Initialize first value to 0
+            int heads_count = 1;  // Track number of forks
+
+            for (int n = 0; n < 8; n++) {
+
+                uint8_t hydra_head = getSixBitByte(c, n);
+
+                // the modulus hash0() applied to this chunk, mirroring the loop there
+                uint8_t modulus = (n < 4) ? (63 - n) : (64 - (n - 4));
+
+                // the only other value that reduces to the same residue
+                uint8_t alt_head = hydra_head + modulus;
+
+                if (alt_head <= 0x3F) {
+
+                    // Create new forks by duplicating existing uint64_t values
+                    int new_head = heads_count * 2;
+
+                    // proper realloc pattern
+                    uint64_t *ptmp = (uint64_t *)realloc(hydra_heads, new_head * sizeof(uint64_t));
+                    if (ptmp == NULL) {
+                        PrintAndLogEx(WARNING, "Failed to allocate memory");
+                        free(hydra_heads);
+                        return;
+                    }
+                    hydra_heads = ptmp;
+
+                    // keep the residue in the existing branch, the alternative in the copy
+                    for (int i = 0; i < heads_count; i++) {
+                        hydra_heads[heads_count + i] = hydra_heads[i];
+                        pushbackSixBitByte(&hydra_heads[i], hydra_head, n);
+                        pushbackSixBitByte(&hydra_heads[heads_count + i], alt_head, n);
+                    }
+                    // Update the count of total values
+                    heads_count = new_head;
+                } else {
+                    // no hydra head spawns
+                    for (int i = 0; i < heads_count; i++) {
+                        pushbackSixBitByte(&hydra_heads[i], hydra_head, n);
+                    }
+                }
+            }
+
+            for (int i = 0; i < heads_count; i++) {
+
+                // restore the two most significant bytes (x and y)
+                hydra_heads[i] |= ((uint64_t)x_array[img] << 56);
+                hydra_heads[i] |= ((uint64_t)y << 48);
+
+                if (g_debugMode > 0) {
+                    PrintAndLogEx(DEBUG, "          | x| y|z0|z1|z2|z3|z4|z5|z6|z7|");
+                    printState("origin_r1", hydra_heads[i]);
+                }
+                // reverse the swapZbalues function to get the original six-bit byte order
+                uint64_t original_z = swapZvalues(hydra_heads[i]);
+
+                if (g_debugMode > 0) {
+                    PrintAndLogEx(DEBUG, "          | x| y|z0|z1|z2|z3|z4|z5|z6|z7|");
+                    printState("origin_r2", original_z);
+                    PrintAndLogEx(INFO, "--------------------------");
+                }
+                // run pre-image through hash0
+                uint8_t img_div_key[8] = {0};
+                hash0(original_z, img_div_key); // commented to avoid log spam
+
+                // verify result, if it matches add it to the list as a valid pre-image
+                bool image_match = true;
+                for (int v = 0; v < 8; v++) {
+
+                    // compare against input key k
+                    if (img_div_key[v] != k[v]) {
+                        image_match = false;
+                    }
+
+                }
+
+                uint8_t des_pre_image[8] = {0};
+                x_num_to_bytes(original_z, sizeof(original_z), des_pre_image);
+
+                if (image_match) {
+                    PrintAndLogEx(INFO, "Pre-image......... " _YELLOW_("%s") " ( "_GREEN_("ok") " )", sprint_hex_inrow(des_pre_image, sizeof(des_pre_image)));
+                } else {
+
+                    if (g_debugMode > 0) {
+                        PrintAndLogEx(INFO, "Pre-image......... " _YELLOW_("%s") " ( "_RED_("invalid") " )", sprint_hex_inrow(des_pre_image, sizeof(des_pre_image)));
+                    }
+                }
+            }
+            // Free allocated memory
+            free(hydra_heads);
+
+        } // for each zP candidate
+    }
+}
+
 /**
  * @brief Performs Elite-class key diversification
  * @param csn
@@ -472,17 +884,17 @@ static bool des_getParityBitFromKey(uint8_t key) {
 }
 
 static void des_checkParity(uint8_t *key) {
-    int i;
     int fails = 0;
-    for (i = 0; i < 8; i++) {
+    for (uint8_t i = 0; i < 8; i++) {
         bool parity = des_getParityBitFromKey(key[i]);
         if (parity != (key[i] & 0x1)) {
             fails++;
             PrintAndLogEx(FAILED, "parity1 fail, byte %d [%02x] was %d, should be %d", i, key[i], (key[i] & 0x1), parity);
         }
     }
+
     if (fails) {
-        PrintAndLogEx(FAILED, "parity fails: %d", fails);
+        PrintAndLogEx(FAILED, "parity fails...  " _RED_("%d"), fails);
     } else {
         PrintAndLogEx(SUCCESS, "    Key syntax is with parity bits inside each byte (%s)", _GREEN_("ok"));
     }
@@ -563,15 +975,17 @@ static int testKeyDiversificationWithMasterkeyTestcases(uint8_t *key) {
     int i, error = 0;
     uint8_t empty[8] = {0};
 
-    PrintAndLogEx(INFO, "Testing encryption/decryption");
+    PrintAndLogEx(INFO, "Testing encryption/decryption...");
 
-    for (i = 0; memcmp(testcases + i, empty, 8); i++)
+    for (i = 0; memcmp(testcases + i, empty, 8); i++) {
         error += testDES(key, testcases[i]);
+    }
 
-    if (error)
-        PrintAndLogEx(FAILED, "%d errors occurred (%d testcases)", error, i);
-    else
-        PrintAndLogEx(SUCCESS, "Hashing seems to work (%d testcases)", i);
+    if (error) {
+        PrintAndLogEx(FAILED, "%d errors occurred, %d testcases ( %s )", error, i, _RED_("fail"));
+    } else {
+        PrintAndLogEx(SUCCESS, "    Hashing seems to work, " _YELLOW_("%d") " testcases ( %s )", i, _GREEN_("ok"));
+    }
     return error;
 }
 
@@ -611,8 +1025,9 @@ static int testDES2(uint8_t *key, uint64_t csn, uint64_t expected) {
     PrintAndLogEx(DEBUG, "   {csn}    %"PRIx64, crypt_csn);
     PrintAndLogEx(DEBUG, "   expected %"PRIx64 "    (%s)", expected, (expected == crypt_csn) ? _GREEN_("ok") : _RED_("fail"));
 
-    if (expected != crypt_csn)
+    if (expected != crypt_csn) {
         return PM3_ESOFT;
+    }
     return PM3_SUCCESS;
 }
 
@@ -623,12 +1038,12 @@ static int testDES2(uint8_t *key, uint64_t csn, uint64_t expected) {
  */
 static int doTestsWithKnownInputs(void) {
     // KSel from http://www.proxmark.org/forum/viewtopic.php?pid=10977#p10977
-    PrintAndLogEx(INFO, "Testing DES encryption");
+    PrintAndLogEx(INFO, "Testing DES encryption... ");
     uint8_t key[8] = {0x6c, 0x8d, 0x44, 0xf9, 0x2a, 0x2d, 0x01, 0xbf};
 
     testDES2(key, 0xbbbbaaaabbbbeeee, 0xd6ad3ca619659e6b);
 
-    PrintAndLogEx(INFO, "Testing hashing algorithm");
+    PrintAndLogEx(INFO, "Testing hashing algorithm... ");
 
     int res = PM3_SUCCESS;
     res += testCryptedCSN(0x0102030405060708, 0x0bdd6512073c460a);
@@ -642,57 +1057,29 @@ static int doTestsWithKnownInputs(void) {
     res += testCryptedCSN(0x14e2adfc5bb7e134, 0x6ac90c6508bd9ea3);
 
     if (res != PM3_SUCCESS) {
-        PrintAndLogEx(FAILED, "%d res occurred (9 testcases)", res);
+        PrintAndLogEx(FAILED, "%d res occurred " _YELLOW_("9") " testcases ( %s )", res, _RED_("fail"));
         res = PM3_ESOFT;
     } else {
-        PrintAndLogEx(SUCCESS, "Hashing seems to work (9 testcases)");
+        PrintAndLogEx(SUCCESS, "    Hashing seems to work " _YELLOW_("9") " testcases ( %s )", _GREEN_("ok"));
         res = PM3_SUCCESS;
     }
     return res;
 }
 
-static bool readKeyFile(uint8_t *key, size_t keylen) {
-
-    bool retval = false;
-    size_t len = 0;
-    uint8_t *keyptr = NULL;
-    if (loadFile_safe("iclass_key.bin", "", (void **)&keyptr, &len) != PM3_SUCCESS) {
-        return retval;
-    }
-    if (keylen == len) {
-        memcpy(key, keyptr, keylen);
-        retval = true;
-    }
-    free(keyptr);
-    return retval;
-}
-
 int doKeyTests(void) {
 
-    PrintAndLogEx(INFO, "Checking if the master key is present (iclass_key.bin)...");
-    uint8_t key[8] = {0};
-    if (readKeyFile(key, sizeof(key)) == false) {
-        PrintAndLogEx(FAILED, "Master key not present, will not be able to do all testcases");
-    } else {
+    uint8_t key[8] = { 0xAE, 0xA6, 0x84, 0xA6, 0xDA, 0xB2, 0x32, 0x78 };
+    uint8_t parity[8] = {0x00, 0x01, 0x01, 0x01, 0x00, 0x01, 0x00, 0x01};
 
-        //Test if it's the right key...
-        uint8_t i;
-        uint8_t j = 0;
-        for (i = 0; i < ARRAYLEN(key); i++)
-            j += key[i];
-
-        if (j != 185) {
-            PrintAndLogEx(INFO, "A key was loaded, but it does not seem to be the correct one. Aborting these tests");
-        } else {
-            PrintAndLogEx(SUCCESS, "Key present");
-            PrintAndLogEx(SUCCESS, "Checking key parity...");
-            des_checkParity(key);
-
-            // Test hashing functions
-            PrintAndLogEx(SUCCESS, "The following tests require the correct 8-byte master key");
-            testKeyDiversificationWithMasterkeyTestcases(key);
-        }
+    for (int i = 0; i < 8; i++) {
+        key[i] += parity[i];
     }
+
+    PrintAndLogEx(SUCCESS, "Checking key parity...");
+    des_checkParity(key);
+
+    // Test hashing functions
+    testKeyDiversificationWithMasterkeyTestcases(key);
     PrintAndLogEx(INFO, "Testing key diversification with non-sensitive keys...");
     return doTestsWithKnownInputs();
 }

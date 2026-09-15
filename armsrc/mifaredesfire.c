@@ -23,13 +23,14 @@
 #include "desfire_crypto.h"
 #include "cmd.h"
 #include "dbprint.h"
-#include "fpgaloader.h"
+#include "fpga_loader.h"
+#include "fpga_apis.h"
 #include "iso14443a.h"
 #include "crc16.h"
 #include "commonutil.h"
 #include "util.h"
 #include "mifare.h"
-#include "ticks.h"
+#include "ticks_apis.h"
 #include "protocols.h"
 
 #define MAX_APPLICATION_COUNT 28
@@ -60,9 +61,9 @@ bool InitDesfireCard(void) {
     iso14443a_setup(FPGA_HF_ISO14443A_READER_LISTEN);
     set_tracing(true);
 
-    if (!iso14443a_select_card(NULL, &card, NULL, true, 0, false)) {
+    if (iso14443a_select_card(NULL, &card, NULL, true, 0, false) == 0) {
         if (g_dbglevel >= DBG_ERROR) DbpString("Can't select card");
-        OnError(1);
+        OnErrorNG(CMD_HF_DESFIRE_COMMAND, 1);
         return false;
     }
     return true;
@@ -81,7 +82,7 @@ void MifareSendCommand(uint8_t *datain) {
     } PACKED;
     struct p *payload = (struct p *) datain;
 
-    uint8_t resp[RECEIVE_SIZE];
+    uint8_t resp[MAX_FRAME_SIZE];
     memset(resp, 0, sizeof(resp));
 
     if (g_dbglevel >= DBG_EXTENDED) {
@@ -94,7 +95,7 @@ void MifareSendCommand(uint8_t *datain) {
         clear_trace();
 
     if (payload->flags & INIT) {
-        if (!InitDesfireCard()) {
+        if (InitDesfireCard() == false) {
             return;
         }
     }
@@ -103,15 +104,15 @@ void MifareSendCommand(uint8_t *datain) {
     if (g_dbglevel >= DBG_EXTENDED)
         print_result("RESP <--: ", resp, len);
 
-    if (!len) {
-        OnError(2);
+    if (len == 0) {
+        OnErrorNG(CMD_HF_DESFIRE_COMMAND, 2);
         return;
     }
 
     if (payload->flags & DISCONNECT)
         OnSuccess();
 
-    //reply_mix(CMD_ACK, 1, len, 0, resp, len);
+    //reply_ng(CMD_HF_DESFIRE_COMMAND, PM3_SUCCESS, resp, len);
     LED_B_ON();
 
 
@@ -157,7 +158,7 @@ void MifareDesfireGetInformation(void) {
     pcb_blocknum = 0;
 
     // card select - information
-    if (!iso14443a_select_card(NULL, &card, NULL, true, 0, false)) {
+    if (iso14443a_select_card(NULL, &card, NULL, true, 0, false) == 0) {
         if (g_dbglevel >= DBG_ERROR) {
             DbpString("Can't select card");
         }
@@ -323,6 +324,10 @@ void MifareDES_Auth1(uint8_t *datain) {
             memcpy(keybytes, PICC_MASTER_KEY24, 24);
         }
     } else {
+        if (payload->keylen > sizeof(keybytes)) {
+            OnErrorNG(CMD_HF_DESFIRE_AUTH1, PM3_EINVARG);
+            return;
+        }
         memcpy(keybytes, payload->key, payload->keylen);
     }
 
@@ -343,10 +348,11 @@ void MifareDES_Auth1(uint8_t *datain) {
 
     uint8_t subcommand = MFDES_AUTHENTICATE;
 
-    if (payload->mode == MFDES_AUTH_AES)
+    if (payload->mode == MFDES_AUTH_AES) {
         subcommand = MFDES_AUTHENTICATE_AES;
-    else if (payload->mode == MFDES_AUTH_ISO)
+    } else if (payload->mode == MFDES_AUTH_ISO) {
         subcommand = MFDES_AUTHENTICATE_ISO;
+    }
 
     if (payload->mode != MFDES_AUTH_PICC) {
         // Let's send our auth command
@@ -364,17 +370,17 @@ void MifareDES_Auth1(uint8_t *datain) {
         len = DesfireAPDU(cmd, 2, resp);
     }
 
-    if (!len) {
+    if (len == 0) {
         if (g_dbglevel >= DBG_ERROR) {
             DbpString("Authentication failed. Card timeout.");
         }
-        OnErrorNG(CMD_HF_DESFIRE_AUTH1, 3);
+        OnErrorNG(CMD_HF_DESFIRE_AUTH1, PM3_ETIMEOUT);
         return;
     }
 
     if (resp[2] == (uint8_t)MFDES_ADDITIONAL_FRAME) {
         DbpString("Authentication failed. Invalid key number.");
-        OnErrorNG(CMD_HF_DESFIRE_AUTH1, 3);
+        OnErrorNG(CMD_HF_DESFIRE_AUTH1, PM3_EINVARG);
         return;
     }
 
@@ -395,7 +401,7 @@ void MifareDES_Auth1(uint8_t *datain) {
             DbpString("Authentication failed. Length of answer doesn't match algo.");
             print_result("Res-Buffer: ", resp, len);
         }
-        OnErrorNG(CMD_HF_DESFIRE_AUTH1, 3);
+        OnErrorNG(CMD_HF_DESFIRE_AUTH1, PM3_EWRONGANSWER);
         return;
     }
 
@@ -408,20 +414,23 @@ void MifareDES_Auth1(uint8_t *datain) {
 
     // Part 3
     if (payload->algo == MFDES_ALGO_AES) {
+
         if (mbedtls_aes_setkey_dec(&ctx, key->data, 128) != 0) {
             if (g_dbglevel >= DBG_EXTENDED) {
                 DbpString("mbedtls_aes_setkey_dec failed");
             }
-            OnErrorNG(CMD_HF_DESFIRE_AUTH1, 7);
+            OnErrorNG(CMD_HF_DESFIRE_AUTH1, PM3_ECRYPTO);
             return;
         }
         mbedtls_aes_crypt_cbc(&ctx, MBEDTLS_AES_DECRYPT, 16, IV, encRndB, RndB);
-    } else if (payload->algo == MFDES_ALGO_DES)
+
+    } else if (payload->algo == MFDES_ALGO_DES) {
         des_decrypt(RndB, encRndB, key->data);
-    else if (payload->algo == MFDES_ALGO_3DES)
+    } else if (payload->algo == MFDES_ALGO_3DES) {
         tdes_nxp_receive(encRndB, RndB, rndlen, key->data, IV, 2);
-    else if (payload->algo == MFDES_ALGO_3K3DES)
+    } else if (payload->algo == MFDES_ALGO_3K3DES) {
         tdes_nxp_receive(encRndB, RndB, rndlen, key->data, IV, 3);
+    }
 
     // - Rotate RndB by 8 bits
     memcpy(rotRndB, RndB, rndlen);
@@ -431,6 +440,7 @@ void MifareDES_Auth1(uint8_t *datain) {
 
     // - Encrypt our response
     if (payload->mode == MFDES_AUTH_DES || payload->mode == MFDES_AUTH_PICC) {
+
         des_decrypt(encRndA, RndA, key->data);
         memcpy(both, encRndA, rndlen);
 
@@ -440,7 +450,9 @@ void MifareDES_Auth1(uint8_t *datain) {
 
         des_decrypt(encRndB, rotRndB, key->data);
         memcpy(both + 8, encRndB, rndlen);
+
     } else if (payload->mode == MFDES_AUTH_ISO) {
+
         if (payload->algo == MFDES_ALGO_3DES) {
             uint8_t tmp[16] = {0x00};
             memcpy(tmp, RndA, rndlen);
@@ -452,16 +464,20 @@ void MifareDES_Auth1(uint8_t *datain) {
             memcpy(tmp + rndlen, rotRndB, rndlen);
             tdes_nxp_send(tmp, both, 32, key->data, IV, 3);
         }
+
     } else if (payload->mode == MFDES_AUTH_AES) {
+
         uint8_t tmp[32] = {0x00};
         memcpy(tmp, RndA, rndlen);
         memcpy(tmp + 16, rotRndB, rndlen);
+
         if (payload->algo == MFDES_ALGO_AES) {
+
             if (mbedtls_aes_setkey_enc(&ctx, key->data, 128) != 0) {
                 if (g_dbglevel >= DBG_EXTENDED) {
                     DbpString("mbedtls_aes_setkey_enc failed");
                 }
-                OnErrorNG(CMD_HF_DESFIRE_AUTH1, 7);
+                OnErrorNG(CMD_HF_DESFIRE_AUTH1, PM3_ECRYPTO);
                 return;
             }
             mbedtls_aes_crypt_cbc(&ctx, MBEDTLS_AES_ENCRYPT, 32, IV, tmp, both);
@@ -472,6 +488,7 @@ void MifareDES_Auth1(uint8_t *datain) {
     if (payload->algo == MFDES_ALGO_AES || payload->algo == MFDES_ALGO_3K3DES) {
         bothlen = 32;
     }
+
     if (payload->mode != MFDES_AUTH_PICC) {
         cmd[0] = 0x90;
         cmd[1] = MFDES_ADDITIONAL_FRAME;
@@ -487,34 +504,39 @@ void MifareDES_Auth1(uint8_t *datain) {
         len = DesfireAPDU(cmd, 1 + bothlen, resp);
     }
 
-    if (!len) {
+    if (len == 0) {
         if (g_dbglevel >= DBG_ERROR) {
             DbpString("Authentication failed. Card timeout.");
         }
-        OnErrorNG(CMD_HF_DESFIRE_AUTH1, 3);
+        OnErrorNG(CMD_HF_DESFIRE_AUTH1, PM3_ETIMEOUT);
         return;
     }
 
     if (payload->mode != MFDES_AUTH_PICC) {
+
         if ((resp[len - 4] != 0x91) || (resp[len - 3] != 0x00)) {
             DbpString("Authentication failed.");
-            OnErrorNG(CMD_HF_DESFIRE_AUTH1, 6);
+            OnErrorNG(CMD_HF_DESFIRE_AUTH1, PM3_ESOFT);
             return;
         }
+
     } else {
+
         if (resp[1] != 0x00) {
             DbpString("Authentication failed.");
-            OnErrorNG(CMD_HF_DESFIRE_AUTH1, 6);
+            OnErrorNG(CMD_HF_DESFIRE_AUTH1, PM3_ESOFT);
             return;
         }
+
     }
 
     // Part 4
 
     Desfire_session_key_new(RndA, RndB, key, sessionkey);
 
-    if (g_dbglevel >= DBG_EXTENDED)
+    if (g_dbglevel >= DBG_EXTENDED) {
         print_result("SESSIONKEY : ", sessionkey->data, payload->keylen);
+    }
 
     if (payload->mode != MFDES_AUTH_PICC) {
         memcpy(encRndA, resp + 1, rndlen);
@@ -523,18 +545,22 @@ void MifareDES_Auth1(uint8_t *datain) {
     }
 
     if (payload->mode == MFDES_AUTH_DES || payload->mode == MFDES_AUTH_PICC) {
-        if (payload->algo == MFDES_ALGO_DES)
+
+        if (payload->algo == MFDES_ALGO_DES) {
             des_decrypt(encRndA, encRndA, key->data);
-        else if (payload->algo == MFDES_ALGO_3DES)
+        } else if (payload->algo == MFDES_ALGO_3DES) {
             tdes_nxp_receive(encRndA, encRndA, rndlen, key->data, IV, 2);
-        else if (payload->algo == MFDES_ALGO_3K3DES)
+        } else if (payload->algo == MFDES_ALGO_3K3DES) {
             tdes_nxp_receive(encRndA, encRndA, rndlen, key->data, IV, 3);
+        }
+
     } else if (payload->mode == MFDES_AUTH_AES) {
+
         if (mbedtls_aes_setkey_dec(&ctx, key->data, 128) != 0) {
             if (g_dbglevel >= DBG_EXTENDED) {
                 DbpString("mbedtls_aes_setkey_dec failed");
             }
-            OnErrorNG(CMD_HF_DESFIRE_AUTH1, 7);
+            OnErrorNG(CMD_HF_DESFIRE_AUTH1, PM3_ECRYPTO);
             return;
         }
         mbedtls_aes_crypt_cbc(&ctx, MBEDTLS_AES_DECRYPT, 16, IV, encRndA, encRndA);
@@ -546,10 +572,11 @@ void MifareDES_Auth1(uint8_t *datain) {
         print_result("RndB: ", RndB, rndlen);
         print_result("encRndA : ", encRndA, rndlen);
     }
+
     for (int x = 0; x < rndlen; x++) {
         if (RndA[x] != encRndA[x]) {
             DbpString("Authentication failed. Cannot verify Session Key.");
-            OnErrorNG(CMD_HF_DESFIRE_AUTH1, 4);
+            OnErrorNG(CMD_HF_DESFIRE_AUTH1, PM3_ECRYPTO);
             return;
         }
     }
@@ -645,10 +672,6 @@ void MifareDES_Auth1(uint8_t *datain) {
     */
 
 
-    //OnSuccess();
-    //reply_old(CMD_ACK, 1, 0, 0, skey->data, payload->keylen);
-    //reply_mix(CMD_ACK, 1, len, 0, resp, len);
-
     LED_B_ON();
     authres_t rpayload;
     rpayload.sessionkeylen = payload->keylen;
@@ -671,15 +694,19 @@ int DesfireAPDU(uint8_t *cmd, size_t cmd_len, uint8_t *dataout) {
 
     wrappedLen = CreateAPDU(cmd, cmd_len, wCmd);
 
-    if (g_dbglevel >= DBG_EXTENDED)
+    if (g_dbglevel >= DBG_EXTENDED) {
         print_result("WCMD <--: ", wCmd, wrappedLen);
+    }
 
     ReaderTransmit(wCmd, wrappedLen, NULL);
 
-    len = ReaderReceive(resp, par);
-    if (!len) {
-        if (g_dbglevel >= DBG_EXTENDED) Dbprintf("fukked");
+    len = ReaderReceive(resp, sizeof(resp), par);
+    if (len == 0) {
+        if (g_dbglevel >= DBG_EXTENDED) {
+            Dbprintf("Error: data link failed");
+        }
         return false; //DATA LINK ERROR
+
     }
     // if we received an I- or R(ACK)-Block with a block number equal to the
     // current block number, toggle the current block number
@@ -705,12 +732,15 @@ size_t CreateAPDU(uint8_t *datain, size_t len, uint8_t *dataout) {
     cmd[0] = 0x02;  //  0x0A = send cid,  0x02 = no cid.
     cmd[0] |= pcb_blocknum; // OR the block number into the PCB
 
-    if (g_dbglevel >= DBG_EXTENDED) Dbprintf("pcb_blocknum %d == %d ", pcb_blocknum, cmd[0]);
+    if (g_dbglevel >= DBG_EXTENDED) {
+        Dbprintf("pcb_blocknum %d == %d ", pcb_blocknum, cmd[0]);
+    }
 
     //cmd[1] = 0x90;  //  CID: 0x00 //TODO: allow multiple selected cards
 
-    memcpy(cmd + 1, datain, len);
-    AddCrc14A(cmd, len + 1);
+    // bytes that actually fit; may be less than len
+    memcpy(cmd + 1, datain,  cmdlen - 3);
+    AddCrc14A(cmd,  cmdlen - 3 + 1);
 
     /*
     hf 14a apdu -sk 90 60 00 00 00
@@ -727,17 +757,20 @@ size_t CreateAPDU(uint8_t *datain, size_t len, uint8_t *dataout) {
 // uint32_t crc = crc_finish(&desfire_crc32);
 
 void OnSuccess(void) {
+    size_t len = 0;
+    uint8_t resp[MAX_FRAME_SIZE];
+    uint8_t par[MAX_PARITY_SIZE];
+
     pcb_blocknum = 0;
     ReaderTransmit(deselect_cmd, 3, NULL);
-    if (mifare_ultra_halt()) {
-        if (g_dbglevel >= DBG_ERROR) Dbprintf("Halt error");
+    len = ReaderReceive(resp, sizeof(resp), par);
+    if (len == 0) {
+        if (mifare_ultra_halt()) {
+            if (g_dbglevel >= DBG_ERROR) Dbprintf("Halt error");
+        }
     }
-    switch_off();
-}
 
-void OnError(uint8_t reason) {
-    reply_mix(CMD_ACK, 0, reason, 0, 0, 0);
-    OnSuccess();
+    switch_off();
 }
 
 void OnErrorNG(uint16_t cmd, uint8_t reason) {

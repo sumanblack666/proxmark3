@@ -22,8 +22,13 @@
 #include <limits.h>
 #include <ctype.h>
 #include <math.h>
+#include <unistd.h>
+
+#include "relay/relay.h"
+
 #include "cmdparser.h"      // command_t
 #include "comms.h"
+#include "util.h"           // set_rgb
 #include "commonutil.h"     // ARRAYLEN
 #include "lfdemod.h"        // device/client demods of LF signals
 #include "ui.h"             // for show graph controls
@@ -34,15 +39,18 @@
 #include "cmdhw.h"          // for setting FPGA image
 #include "cmdlfawid.h"      // for awid menu
 #include "cmdlfem.h"        // for em menu
-#include "cmdlfem410x.h"      // for em4x menu
+#include "cmdlfem410x.h"    // for em4x menu
 #include "cmdlfem4x05.h"    // for em4x05 / 4x69
 #include "cmdlfem4x50.h"    // for em4x50
 #include "cmdlfem4x70.h"    // for em4x70
 #include "cmdlfhid.h"       // for hid menu
 #include "cmdlfhitag.h"     // for hitag menu
+#include "cmdlfhitaghts.h"  // for hitag S sub commands
+#include "cmdlfhitagu.h"    // for hitag µ sub commands
 #include "cmdlfidteck.h"    // for idteck menu
 #include "cmdlfio.h"        // for ioprox menu
 #include "cmdlfcotag.h"     // for COTAG menu
+#include "pm3_dsp.h"        // pm3_extract, pm3_is_switched_carrier
 #include "cmdlfdestron.h"   // for FDX-A FECAVA Destron menu
 #include "cmdlffdxb.h"      // for FDX-B menu
 #include "cmdlfgallagher.h" // for GALLAGHER menu
@@ -62,11 +70,15 @@
 #include "cmdlfsecurakey.h" // for securakey menu
 #include "cmdlft55xx.h"     // for t55xx menu
 #include "cmdlfti.h"        // for ti menu
+#include "cmdlftrovan.h"    // for trovan menu
 #include "cmdlfviking.h"    // for viking menu
 #include "cmdlfvisa2000.h"  // for VISA2000 menu
 #include "cmdlfzx8211.h"    // for ZX8211 menu
 #include "crc.h"
 #include "pm3_cmd.h"        // for LF_CMDREAD_MAX_EXTRA_SYMBOLS
+#include "fpga.h"           // for set_fpga_mode
+#include "util_posix.h"         // msleep
+
 
 static int CmdHelp(const char *Cmd);
 
@@ -80,7 +92,7 @@ int lfsim_wait_check(uint32_t cmd) {
     for (;;) {
         if (kbd_enter_pressed()) {
             SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
-            PrintAndLogEx(DEBUG, "User aborted");
+            PrintAndLogEx(DEBUG, "\naborted via keyboard!");
             break;
         }
 
@@ -94,6 +106,22 @@ int lfsim_wait_check(uint32_t cmd) {
     }
     PrintAndLogEx(INFO, "Done!");
     return PM3_SUCCESS;
+}
+
+// Mirror an antenna tuning level on the PM5 antenna RGB LED. `volt` is scaled
+// relative to the running peak (`v_max`), so the colour tracks the on-screen bar:
+// blue = low, green = mid, red = high.
+static void tune_rgb_update(uint32_t volt, uint32_t v_max) {
+    uint32_t t = (v_max > 0) ? (volt * 510 / v_max) : 0;
+    if (t > 510) {
+        t = 510;
+    }
+    if (t < 255) {          // blue -> green
+        set_rgb(0, (uint8_t)t, (uint8_t)(255 - t));
+    } else {                // green -> red
+        t -= 255;
+        set_rgb((uint8_t)t, (uint8_t)(255 - t), 0);
+    }
 }
 
 static int CmdLFTune(const char *Cmd) {
@@ -117,6 +145,7 @@ static int CmdLFTune(const char *Cmd) {
         arg_lit0(NULL, "mix", "mixed style"),
         arg_lit0(NULL, "value", "values style"),
         arg_lit0("v", "verbose", "verbose output"),
+        arg_lit0(NULL, "rgb", "(PM5) mirror the tuning level on the antenna RGB LED"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
@@ -128,7 +157,13 @@ static int CmdLFTune(const char *Cmd) {
     bool is_mix = arg_get_lit(ctx, 5);
     bool is_value = arg_get_lit(ctx, 6);
     bool verbose = arg_get_lit(ctx, 7);
+    bool use_rgb = arg_get_lit(ctx, 8);
     CLIParserFree(ctx);
+
+    if (use_rgb && (IfPm5() == false)) {
+        PrintAndLogEx(WARNING, "`--rgb` is only supported on Proxmark5; ignoring");
+        use_rgb = false;
+    }
 
     if (divisor < 19) {
         PrintAndLogEx(ERR, "divisor must be between 19 and 255");
@@ -175,7 +210,7 @@ static int CmdLFTune(const char *Cmd) {
 
     SendCommandNG(CMD_MEASURE_ANTENNA_TUNING_LF, params, sizeof(params));
     if (WaitForResponseTimeout(CMD_MEASURE_ANTENNA_TUNING_LF, &resp, 1000) == false) {
-        PrintAndLogEx(WARNING, "Timeout while waiting for Proxmark LF initialization, aborting");
+        PrintAndLogEx(WARNING, "timeout while waiting for Proxmark LF initialization, aborting");
         return PM3_ETIMEOUT;
     }
 
@@ -199,7 +234,7 @@ static int CmdLFTune(const char *Cmd) {
         SendCommandNG(CMD_MEASURE_ANTENNA_TUNING_LF, params, sizeof(params));
         if (WaitForResponseTimeout(CMD_MEASURE_ANTENNA_TUNING_LF, &resp, 1000) == false) {
             PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(WARNING, "Timeout while waiting for Proxmark LF measure, aborting");
+            PrintAndLogEx(WARNING, "timeout while waiting for Proxmark LF measure, aborting");
             break;
         }
 
@@ -221,16 +256,22 @@ static int CmdLFTune(const char *Cmd) {
             v_count++;
         }
         print_progress(volt, v_max, style);
+        if (use_rgb) {
+            tune_rgb_update(volt, v_max);
+        }
+    }
+    if (use_rgb) {
+        set_rgb(0, 0, 0); // turn the LED off on exit
     }
 
     params[0] = 3;
     SendCommandNG(CMD_MEASURE_ANTENNA_TUNING_LF, params, sizeof(params));
     if (WaitForResponseTimeout(CMD_MEASURE_ANTENNA_TUNING_LF, &resp, 1000) == false) {
-        PrintAndLogEx(WARNING, "Timeout while waiting for Proxmark LF shutdown, aborting");
+        PrintAndLogEx(WARNING, "timeout while waiting for Proxmark LF shutdown, aborting");
         return PM3_ETIMEOUT;
     }
 
-    PrintAndLogEx(NORMAL, "\x1b%c[2K\r", 30);
+    PrintAndLogEx(NORMAL, _CLR_LINE_ "\r");
     if (verbose) {
         PrintAndLogEx(INFO, "Min....... %u mV", v_min);
         PrintAndLogEx(INFO, "Max....... %u mV", v_max);
@@ -240,16 +281,19 @@ static int CmdLFTune(const char *Cmd) {
     return PM3_SUCCESS;
 }
 
+#define PAYLOAD_HEADER_SIZE (12 + (3 * LF_CMDREAD_MAX_EXTRA_SYMBOLS))
+
 /* send a LF command before reading */
 int CmdLFCommandRead(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "lf cmdread",
                   "Modulate LF reader field to send command before read. All periods in microseconds.\n"
                   " - use " _YELLOW_("`lf config`") _CYAN_(" to set parameters"),
-                  "lf cmdread -d 50 -z 116 -o 166 -e W3000 -c W00110                           --> probing for Hitag1/S\n"
-                  "lf cmdread -d 50 -z 116 -o 166 -e W3000 -c W11000                           --> probing for Hitag2\n"
-                  "lf cmdread -d 50 -z 116 -o 166 -e W3000 -c W11000 -s 2000 -@                --> probing for Hitag2, oscilloscope style\n"
-                  "lf cmdread -d 48 -z 112 -o 176 -e W3000 -e S240 -e E336 -c W0S00000010000E  --> probing for Hitag (us)\n"
+                  "lf cmdread -d 50 -z 116 -o 166 -e W3000 -c W00110                           --> probing for Hitag 1/S\n"
+                  "lf cmdread -d 50 -z 116 -o 166 -e W3000 -c W11000                           --> probing for Hitag 2/S\n"
+                  "lf cmdread -d 50 -z 116 -o 166 -e W3000 -c W11010                           --> probing for Hitag S\n"
+                  "lf cmdread -d 50 -z 116 -o 166 -e W3000 -c W11000 -s 2000 -@                --> probing for Hitag 2/S, oscilloscope style\n"
+                  "lf cmdread -d 48 -z 112 -o 176 -e W3000 -e S240 -e E336 -c W0S00000010000E  --> probing for Hitag µ(micro)\n"
                  );
 
     char div_str[70] = {0};
@@ -272,28 +316,29 @@ int CmdLFCommandRead(const char *Cmd) {
     CLIExecWithReturn(ctx, Cmd, argtable, false);
     uint32_t delay = arg_get_u32_def(ctx, 1, 0);
 
-    int cmd_len = 128;
-    char cmd[128] = {0};
+    char cmd[PM3_CMD_DATA_SIZE - PAYLOAD_HEADER_SIZE] = {0};
+    int cmd_len = sizeof(cmd) - 1; // CLIGetStrWithReturn does not guarantee string to be null-terminated
     CLIGetStrWithReturn(ctx, 2, (uint8_t *)cmd, &cmd_len);
 
-    int extra_arg_len = 250;
     char extra_arg[250] = {0};
+    int extra_arg_len = sizeof(extra_arg) - 1; // CLIGetStrWithReturn does not guarantee string to be null-terminated
     CLIGetStrWithReturn(ctx, 3, (uint8_t *)extra_arg, &extra_arg_len);
 
     uint16_t period_1 = arg_get_u32_def(ctx, 4, 0);
     uint16_t period_0 = arg_get_u32_def(ctx, 5, 0);
     uint32_t samples = arg_get_u32_def(ctx, 6, 0);
+
     bool verbose = arg_get_lit(ctx, 7);
     bool keep_field_on = arg_get_lit(ctx, 8);
     bool add_crc_ht = arg_get_lit(ctx, 9);
     bool cm = arg_get_lit(ctx, 10);
+
     CLIParserFree(ctx);
 
     if (g_session.pm3_present == false) {
         return PM3_ENOTTY;
     }
 
-#define PAYLOAD_HEADER_SIZE (12 + (3 * LF_CMDREAD_MAX_EXTRA_SYMBOLS))
     struct p {
         uint32_t delay;
         uint16_t period_0;
@@ -314,30 +359,46 @@ int CmdLFCommandRead(const char *Cmd) {
     memset(payload.symbol_extra, 0, sizeof(payload.symbol_extra));
     memset(payload.period_extra, 0, sizeof(payload.period_extra));
 
-    if (add_crc_ht && (cmd_len <= 120)) {
+    if (cmd_len > (size_t)(g_conn.max_cmd_data_size - PAYLOAD_HEADER_SIZE) - 8 * add_crc_ht - 1) {
+        PrintAndLogEx(ERR, "cmd too long, max length is %zu", (size_t)(g_conn.max_cmd_data_size - PAYLOAD_HEADER_SIZE) - 8 * add_crc_ht - 1);
+        return PM3_EINVARG;
+    }
+
+    if (add_crc_ht) {
+
         // Hitag 1, Hitag S, ZX8211
         // width=8 poly=0x1d init=0xff refin=false refout=false xorout=0x00 check=0xb4 residue=0x00 name="CRC-8/HITAG"
         crc_t crc;
+        crc_init_ref(&crc, 8, 0x1d, 0xff, 0, false, false);
+
         uint8_t data = 0;
         uint8_t n = 0;
-        crc_init_ref(&crc, 8, 0x1d, 0xff, 0, false, false);
-        uint8_t i;
-        for (i = 0; i < cmd_len; i++) {
+
+        for (int i = 0; i < cmd_len; i++) {
+
             if ((cmd[i] != '0') && (cmd[i] != '1')) {
+                // avoid include 'W0S' in crc
+                crc_init_ref(&crc, 8, 0x1d, 0xff, 0, false, false);
+                n = 0;
+                data = 0;
                 continue;
             }
+
             data <<= 1;
             data += cmd[i] - '0';
-            n += 1;
+            n++;
+
             if (n == 8) {
                 crc_update2(&crc, data, n);
                 n = 0;
                 data = 0;
             }
         }
+
         if (n > 0) {
             crc_update2(&crc, data, n);
         }
+
         uint8_t crc_final = crc_finish(&crc);
         for (int j = 7; j >= 0; j--) {
             cmd[cmd_len] = ((crc_final >> j) & 1) ? '1' : '0';
@@ -345,14 +406,14 @@ int CmdLFCommandRead(const char *Cmd) {
         }
     }
 
-    memcpy(payload.data, cmd, cmd_len);
+    memcpy(payload.data, cmd, cmd_len + 1);
 
     // extra symbol definition
     uint8_t index_extra = 0;
     int i = 0;
     for (; i < extra_arg_len;) {
 
-        if (index_extra < LF_CMDREAD_MAX_EXTRA_SYMBOLS - 1) {
+        if (index_extra < LF_CMDREAD_MAX_EXTRA_SYMBOLS) {
             payload.symbol_extra[index_extra] = extra_arg[i];
             int tmp = atoi(extra_arg + (i + 1));
             payload.period_extra[index_extra] = tmp;
@@ -362,14 +423,15 @@ int CmdLFCommandRead(const char *Cmd) {
                 i++;
 
         } else {
-            PrintAndLogEx(WARNING, "Too many extra symbols, please define up to %i symbols", LF_CMDREAD_MAX_EXTRA_SYMBOLS);
+            PrintAndLogEx(ERR, "Too many extra symbols, please define up to %i symbols", LF_CMDREAD_MAX_EXTRA_SYMBOLS);
+            return PM3_EINVARG;
         }
     }
 
     // bitbang mode
     if (payload.delay == 0) {
         if (payload.period_0 < 7 || payload.period_1 < 7) {
-            PrintAndLogEx(WARNING, "periods cannot be less than 7us in bit bang mode");
+            PrintAndLogEx(ERR, "periods cannot be less than 7us in bit bang mode");
             return PM3_EINVARG;
         }
     }
@@ -403,32 +465,25 @@ int CmdLFCommandRead(const char *Cmd) {
     int ret = PM3_SUCCESS;
     do {
         clearCommandBuffer();
-        SendCommandNG(CMD_LF_MOD_THEN_ACQ_RAW_ADC, (uint8_t *)&payload, PAYLOAD_HEADER_SIZE + cmd_len);
+        SendCommandNG(CMD_LF_MOD_THEN_ACQ_RAW_ADC, (uint8_t *)&payload, PAYLOAD_HEADER_SIZE + cmd_len + 1);
 
-        PacketResponseNG resp;
         // init to ZERO
-        resp.cmd = 0,
-        resp.length = 0,
-        resp.magic = 0,
-        resp.status = 0,
-        resp.crc = 0,
-        resp.ng = false,
-        resp.oldarg[0] = 0;
-        resp.oldarg[1] = 0;
-        resp.oldarg[2] = 0;
-        memset(resp.data.asBytes, 0, PM3_CMD_DATA_SIZE);
+        PacketResponseNG resp;
+        memset(&resp, 0, sizeof(resp));
 
         i = 10;
         // 20sec wait loop
-        while (!WaitForResponseTimeout(CMD_LF_MOD_THEN_ACQ_RAW_ADC, &resp, 2000) && i != 0) {
+        while (WaitForResponseTimeout(CMD_LF_MOD_THEN_ACQ_RAW_ADC, &resp, 2000) == false && i != 0) {
             if (verbose) {
                 PrintAndLogEx(NORMAL, "." NOLF);
             }
             i--;
         }
+
         if (verbose) {
             PrintAndLogEx(NORMAL, "");
         }
+
         if (resp.status != PM3_SUCCESS) {
             PrintAndLogEx(WARNING, "command failed.");
             return PM3_ESOFT;
@@ -441,11 +496,11 @@ int CmdLFCommandRead(const char *Cmd) {
             getSamples(samples, false);
             ret = PM3_SUCCESS;
         } else {
-            PrintAndLogEx(WARNING, "timeout while waiting for reply.");
+            PrintAndLogEx(WARNING, "timeout while waiting for reply");
             return PM3_ETIMEOUT;
         }
 
-    } while (cm && kbd_enter_pressed() == false);
+    } while (cm && (kbd_enter_pressed() == false));
     return ret;
 }
 
@@ -459,7 +514,7 @@ int CmdFlexdemod(const char *Cmd) {
 
     int *data = calloc(g_GraphTraceLen, sizeof(int));
     if (data == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
     memcpy(data, g_GraphBuffer, g_GraphTraceLen);
@@ -534,7 +589,7 @@ int CmdFlexdemod(const char *Cmd) {
 *  this function will save a copy of the current lf config value, and set config to default values.
 *
 */
-int lf_config_savereset(sample_config *config) {
+int lf_resetconfig(sample_config *config) {
 
     if (config == NULL) {
         return PM3_EINVARG;
@@ -558,7 +613,7 @@ int lf_config_savereset(sample_config *config) {
         .verbose = false,
     };
 
-    res = lf_config(&def_config);
+    res = lf_setconfig(&def_config);
     if (res != PM3_SUCCESS) {
         PrintAndLogEx(ERR, "failed to reset LF configuration to default values");
         return res;
@@ -580,7 +635,7 @@ int lf_getconfig(sample_config *config) {
 
     SendCommandNG(CMD_LF_SAMPLING_GET_CONFIG, NULL, 0);
     PacketResponseNG resp;
-    if (!WaitForResponseTimeout(CMD_LF_SAMPLING_GET_CONFIG, &resp, 2000)) {
+    if (WaitForResponseTimeout(CMD_LF_SAMPLING_GET_CONFIG, &resp, 2000) == false) {
         PrintAndLogEx(WARNING, "command execution time out");
         return PM3_ETIMEOUT;
     }
@@ -588,7 +643,7 @@ int lf_getconfig(sample_config *config) {
     return PM3_SUCCESS;
 }
 
-int lf_config(sample_config *config) {
+int lf_setconfig(sample_config *config) {
     if (!g_session.pm3_present) return PM3_ENOTTY;
 
     clearCommandBuffer();
@@ -649,7 +704,7 @@ int CmdLFConfig(const char *Cmd) {
 
     // if called with no params, just print the device config
     if (strlen(Cmd) == 0) {
-        return lf_config(NULL);
+        return lf_setconfig(NULL);
     }
 
     if (use_125 + use_134 > 1) {
@@ -722,15 +777,17 @@ int CmdLFConfig(const char *Cmd) {
         config.trigger_threshold = 0;
     }
 
-    return lf_config(&config);
+    return lf_setconfig(&config);
 }
 
-static int lf_read_internal(bool realtime, bool verbose, uint64_t samples) {
+static int lf_read_internal(bool realtime, bool verbose, uint64_t samples, bool cotag) {
     if (!g_session.pm3_present) return PM3_ENOTTY;
 
     lf_sample_payload_t payload = {0};
     payload.realtime = realtime;
     payload.verbose = verbose;
+    payload.cotag = cotag;
+    payload.samples = (samples > MAX_LF_SAMPLES) ? MAX_LF_SAMPLES : samples;
 
     sample_config current_config;
     int retval = lf_getconfig(&current_config);
@@ -745,12 +802,13 @@ static int lf_read_internal(bool realtime, bool verbose, uint64_t samples) {
     if (realtime) {
         uint8_t *realtimeBuf = calloc(samples, sizeof(uint8_t));
         if (realtimeBuf == NULL) {
-            PrintAndLogEx(FAILED, "failed to allocate memory");
+            PrintAndLogEx(WARNING, "Failed to allocate memory");
             return PM3_EMALLOC;
         }
 
         size_t sample_bytes = samples * bits_per_sample;
         sample_bytes = (sample_bytes / 8) + (sample_bytes % 8 != 0);
+        const size_t expected_bytes = sample_bytes;
 
         // In real-time mode, the LF bitstream should be loaded before receiving raw data.
         // Otherwise, the first batch of raw data might contain the response of CMD_WTX.
@@ -764,28 +822,44 @@ static int lf_read_internal(bool realtime, bool verbose, uint64_t samples) {
         SendCommandNG(CMD_LF_ACQ_RAW_ADC, (uint8_t *)&payload, sizeof(payload));
         if (is_trigger_threshold_set) {
             size_t first_receive_len = 32;
-            // Wait until a bunch of data arrives
-            first_receive_len = WaitForRawDataTimeout(realtimeBuf, first_receive_len, -1, false);
-            sample_bytes = WaitForRawDataTimeout(realtimeBuf + first_receive_len, sample_bytes - first_receive_len, 1000, true);
+            // Wait until a bunch of data arrives. Keep raw mode on across both
+            // calls so the comm thread doesn't briefly fall back to parsing
+            // framed packets out of the still-arriving sample stream.
+            first_receive_len = WaitForRawDataTimeout(realtimeBuf, first_receive_len, -1, false, true);
+            sample_bytes = WaitForRawDataTimeout(realtimeBuf + first_receive_len, sample_bytes - first_receive_len, 1000, true, false);
             sample_bytes += first_receive_len;
         } else {
-            sample_bytes = WaitForRawDataTimeout(realtimeBuf, sample_bytes, 1000, true);
+            sample_bytes = WaitForRawDataTimeout(realtimeBuf, sample_bytes, 1000, true, false);
         }
         samples = sample_bytes * 8 / bits_per_sample;
-        PrintAndLogEx(INFO, "Done: %" PRIu64 " samples (%zu bytes)", samples, sample_bytes);
+        // the inline "Received x / y bytes" counter already says the transfer is
+        // done, so only repeat it in samples when asked
+        if (verbose) {
+            PrintAndLogEx(INFO, "Done: %" PRIu64 " samples (%zu bytes)", samples, sample_bytes);
+        }
         if (samples != 0) {
             getSamplesFromBufEx(realtimeBuf, samples, bits_per_sample, verbose);
         }
 
         free(realtimeBuf);
+
+        if (sample_bytes < expected_bytes) {
+            // keep what did arrive, but don't let it look like a complete read
+            PrintAndLogEx(WARNING, "transfer stopped early, got " _YELLOW_("%zu") " of " _YELLOW_("%zu") " bytes"
+                          , sample_bytes
+                          , expected_bytes
+                         );
+            return PM3_ETIMEOUT;
+        }
     } else {
-        payload.samples = (samples > MAX_LF_SAMPLES) ? MAX_LF_SAMPLES : samples;
         SendCommandNG(CMD_LF_ACQ_RAW_ADC, (uint8_t *)&payload, sizeof(payload));
         PacketResponseNG resp;
+
         if (is_trigger_threshold_set) {
             WaitForResponse(CMD_LF_ACQ_RAW_ADC, &resp);
         } else {
-            if (!WaitForResponseTimeout(CMD_LF_ACQ_RAW_ADC, &resp, 2500)) {
+
+            if (WaitForResponseTimeout(CMD_LF_ACQ_RAW_ADC, &resp, 2500) == false) {
                 PrintAndLogEx(WARNING, "(lf_read) command execution time out");
                 return PM3_ETIMEOUT;
             }
@@ -799,7 +873,11 @@ static int lf_read_internal(bool realtime, bool verbose, uint64_t samples) {
 }
 
 int lf_read(bool verbose, uint64_t samples) {
-    return lf_read_internal(false, verbose, samples);
+    return lf_read_internal(false, verbose, samples, false);
+}
+
+int lf_read_cotag(bool realtime, bool verbose, uint64_t samples) {
+    return lf_read_internal(realtime, verbose, samples, true);
 }
 
 int CmdLFRead(const char *Cmd) {
@@ -808,7 +886,7 @@ int CmdLFRead(const char *Cmd) {
                   "Sniff low frequency signal.\n"
                   " - use " _YELLOW_("`lf config`") _CYAN_(" to set parameters.\n")
                   _CYAN_(" - use ") _YELLOW_("`data plot`") _CYAN_(" to look at it.\n")
-                  _CYAN_("If the number of samples is more than the device memory limit (40000 now), ")
+                  _CYAN_("If the number of samples is more than the device memory limit, ")
                   _CYAN_("it will try to use the real-time sampling mode."),
                   "lf read -v -s 12000   --> collect 12000 samples\n"
                   "lf read -s 3000 -@    --> oscilloscope style \n"
@@ -827,9 +905,16 @@ int CmdLFRead(const char *Cmd) {
     bool cm = arg_get_lit(ctx, 3);
     CLIParserFree(ctx);
 
-    // the 40000 there should be the result of BigBuf_max_traceLen(),
+    // anything past the graph buffer is streamed and then thrown away by
+    // getSamplesFromBufEx(), so don't spend the transfer time on it
+    if (samples > MAX_GRAPH_TRACE_LEN) {
+        PrintAndLogEx(INFO, "Capping to " _YELLOW_("%d") " samples, the graph buffer size", MAX_GRAPH_TRACE_LEN);
+        samples = MAX_GRAPH_TRACE_LEN;
+    }
+
+    // it should be the result of BigBuf_max_traceLen(),
     // but IDK how to get it.
-    bool realtime = samples > 40000;
+    bool realtime = samples >= g_pm3_capabilities.bigbuf_size;
 
     if (g_session.pm3_present == false)
         return PM3_ENOTTY;
@@ -839,10 +924,12 @@ int CmdLFRead(const char *Cmd) {
     }
     int ret = PM3_SUCCESS;
     do {
-        ret = lf_read_internal(realtime, verbose, samples);
-    } while (cm && kbd_enter_pressed() == false);
+        ret = lf_read_internal(realtime, verbose, samples, false);
+    } while (cm && (kbd_enter_pressed() == false));
 
-    if (ret == PM3_SUCCESS) {
+    // a truncated transfer still leaves usable samples in the graph buffer,
+    // so report them. lf_read_internal() has already said it was short.
+    if (ret == PM3_SUCCESS || ret == PM3_ETIMEOUT) {
         PrintAndLogEx(SUCCESS, "Got " _YELLOW_("%zu") " samples", g_GraphTraceLen);
 
         if (getSignalProperties()->isnoise) {
@@ -858,6 +945,7 @@ int lf_sniff(bool realtime, bool verbose, uint64_t samples) {
     lf_sample_payload_t payload = {0};
     payload.realtime = realtime;
     payload.verbose = verbose;
+    payload.samples = (samples > MAX_LF_SAMPLES) ? MAX_LF_SAMPLES : samples;
 
     sample_config current_config;
     int retval = lf_getconfig(&current_config);
@@ -872,12 +960,13 @@ int lf_sniff(bool realtime, bool verbose, uint64_t samples) {
     if (realtime) {
         uint8_t *realtimeBuf = calloc(samples, sizeof(uint8_t));
         if (realtimeBuf == NULL) {
-            PrintAndLogEx(FAILED, "failed to allocate memory");
+            PrintAndLogEx(WARNING, "Failed to allocate memory");
             return PM3_EMALLOC;
         }
 
         size_t sample_bytes = samples * bits_per_sample;
         sample_bytes = (sample_bytes / 8) + (sample_bytes % 8 != 0);
+        const size_t expected_bytes = sample_bytes;
 
         // In real-time mode, the LF bitstream should be loaded before receiving raw data.
         // Otherwise, the first batch of raw data might contain the response of CMD_WTX.
@@ -891,22 +980,36 @@ int lf_sniff(bool realtime, bool verbose, uint64_t samples) {
         SendCommandNG(CMD_LF_SNIFF_RAW_ADC, (uint8_t *)&payload, sizeof(payload));
         if (is_trigger_threshold_set) {
             size_t first_receive_len = 32;
-            // Wait until a bunch of data arrives
-            first_receive_len = WaitForRawDataTimeout(realtimeBuf, first_receive_len, -1, false);
-            sample_bytes = WaitForRawDataTimeout(realtimeBuf + first_receive_len, sample_bytes - first_receive_len, 1000, true);
+            // Wait until a bunch of data arrives. Keep raw mode on across both
+            // calls so the comm thread doesn't briefly fall back to parsing
+            // framed packets out of the still-arriving sample stream.
+            first_receive_len = WaitForRawDataTimeout(realtimeBuf, first_receive_len, -1, false, true);
+            sample_bytes = WaitForRawDataTimeout(realtimeBuf + first_receive_len, sample_bytes - first_receive_len, 1000, true, false);
             sample_bytes += first_receive_len;
         } else {
-            sample_bytes = WaitForRawDataTimeout(realtimeBuf, sample_bytes, 1000, true);
+            sample_bytes = WaitForRawDataTimeout(realtimeBuf, sample_bytes, 1000, true, false);
         }
         samples = sample_bytes * 8 / bits_per_sample;
-        PrintAndLogEx(INFO, "Done: %" PRIu64 " samples (%zu bytes)", samples, sample_bytes);
+        // the inline "Received x / y bytes" counter already says the transfer is
+        // done, so only repeat it in samples when asked
+        if (verbose) {
+            PrintAndLogEx(INFO, "Done: %" PRIu64 " samples (%zu bytes)", samples, sample_bytes);
+        }
         if (samples != 0) {
             getSamplesFromBufEx(realtimeBuf, samples, bits_per_sample, verbose);
         }
 
         free(realtimeBuf);
+
+        if (sample_bytes < expected_bytes) {
+            // keep what did arrive, but don't let it look like a complete read
+            PrintAndLogEx(WARNING, "transfer stopped early, got " _YELLOW_("%zu") " of " _YELLOW_("%zu") " bytes"
+                          , sample_bytes
+                          , expected_bytes
+                         );
+            return PM3_ETIMEOUT;
+        }
     } else {
-        payload.samples = (samples > MAX_LF_SAMPLES) ? MAX_LF_SAMPLES : samples;
         SendCommandNG(CMD_LF_SNIFF_RAW_ADC, (uint8_t *)&payload, sizeof(payload));
         PacketResponseNG resp;
         if (is_trigger_threshold_set) {
@@ -934,7 +1037,7 @@ int CmdLFSniff(const char *Cmd) {
                   " - use " _YELLOW_("`lf config`") _CYAN_(" to set parameters.\n")
                   _CYAN_(" - use ") _YELLOW_("`data plot`") _CYAN_(" to look at sniff signal.\n")
                   _CYAN_(" - use ") _YELLOW_("`lf search -1`") _CYAN_(" to see if signal can be automatic decoded.\n")
-                  _CYAN_("If the number of samples is more than the device memory limit (40000 now), ")
+                  _CYAN_("If the number of samples is more than the device memory limit, ")
                   _CYAN_("it will try to use the real-time sampling mode."),
                   "lf sniff -v\n"
                   "lf sniff -s 3000 -@    --> oscilloscope style \n"
@@ -953,9 +1056,16 @@ int CmdLFSniff(const char *Cmd) {
     bool cm = arg_get_lit(ctx, 3);
     CLIParserFree(ctx);
 
-    // the 40000 there should be the result of BigBuf_max_traceLen(),
+    // anything past the graph buffer is streamed and then thrown away by
+    // getSamplesFromBufEx(), so don't spend the transfer time on it
+    if (samples > MAX_GRAPH_TRACE_LEN) {
+        PrintAndLogEx(INFO, "Capping to " _YELLOW_("%d") " samples, the graph buffer size", MAX_GRAPH_TRACE_LEN);
+        samples = MAX_GRAPH_TRACE_LEN;
+    }
+
+    // it should be the result of BigBuf_max_traceLen(),
     // but IDK how to get it.
-    bool realtime = samples > 40000;
+    bool realtime = samples >= g_pm3_capabilities.bigbuf_size;
 
     if (g_session.pm3_present == false)
         return PM3_ENOTTY;
@@ -966,7 +1076,7 @@ int CmdLFSniff(const char *Cmd) {
     int ret = PM3_SUCCESS;
     do {
         ret = lf_sniff(realtime, verbose, samples);
-    } while (cm && kbd_enter_pressed() == false);
+    } while (cm && (kbd_enter_pressed() == false));
     return ret;
 }
 
@@ -996,23 +1106,26 @@ int lfsim_upload_gb(void) {
     //        1 clear bigbuff
     payload_up.flag = 0x1;
 
-    // fast push mode
-    g_conn.block_after_ACK = true;
+    // No fast-push here: this upload is NG + synchronous WaitForResponse per chunk,
+    // and the block_after_ACK handshake (comms.c) desyncs over the higher-latency
+    // FPC/BWM link, killing the transfer after a few chunks. Also clears any state
+    // leaked by a previous run.
+    g_conn.block_after_ACK = false;
 
     PacketResponseNG resp;
 
     //can send only 512 bits at a time (1 byte sent per bit...)
     PrintAndLogEx(INFO, "." NOLF);
-    for (size_t i = 0; i < g_GraphTraceLen; i += PM3_CMD_DATA_SIZE - 3) {
+    for (size_t i = 0; i < g_GraphTraceLen; i += g_conn.max_cmd_data_size - 3) {
 
-        size_t len = MIN((g_GraphTraceLen - i), PM3_CMD_DATA_SIZE - 3);
+        size_t len = MIN((g_GraphTraceLen - i), (size_t)(g_conn.max_cmd_data_size - 3));
         clearCommandBuffer();
         payload_up.offset = i;
 
         for (size_t j = 0; j < len; j++)
             payload_up.data[j] = g_GraphBuffer[i + j];
 
-        SendCommandNG(CMD_LF_UPLOAD_SIM_SAMPLES, (uint8_t *)&payload_up, sizeof(struct pupload));
+        SendCommandNG(CMD_LF_UPLOAD_SIM_SAMPLES, (uint8_t *)&payload_up, 3 + len);  // header (flag+offset) + actual samples, not the padded struct
         WaitForResponse(CMD_LF_UPLOAD_SIM_SAMPLES, &resp);
         if (resp.status != PM3_SUCCESS) {
             PrintAndLogEx(INFO, "Bigbuf is full");
@@ -1112,9 +1225,10 @@ int CmdLFfskSim(const char *Cmd) {
     uint8_t fchigh = arg_get_u32_def(ctx, 3, 0);
     bool separator = arg_get_lit(ctx, 4);
 
-    int raw_len = 64;
-    char raw[64] = {0};
+    char raw[65] = {0};
+    int raw_len = sizeof(raw) - 1; // CLIGetStrWithReturn does not guarantee string to be null-terminated
     CLIGetStrWithReturn(ctx, 5, (uint8_t *)raw, &raw_len);
+
     bool verbose = arg_get_lit(ctx, 6);
     CLIParserFree(ctx);
 
@@ -1169,13 +1283,18 @@ int CmdLFfskSim(const char *Cmd) {
     }
 
     size_t size = g_DemodBufferLen;
-    if (size > (PM3_CMD_DATA_SIZE - sizeof(lf_fsksim_t))) {
-        PrintAndLogEx(WARNING, "DemodBuffer too long for current implementation - length: %zu - max: %zu", size, PM3_CMD_DATA_SIZE - sizeof(lf_fsksim_t));
+    if (size > (g_conn.max_cmd_data_size - sizeof(lf_fsksim_t))) {
+        PrintAndLogEx(WARNING, "DemodBuffer too long for current implementation - length: %zu - max: %zu", size, (size_t)(g_conn.max_cmd_data_size - sizeof(lf_fsksim_t)));
         PrintAndLogEx(INFO, "Continuing with trimmed down data");
-        size = PM3_CMD_DATA_SIZE - sizeof(lf_fsksim_t);
+        size = g_conn.max_cmd_data_size - sizeof(lf_fsksim_t);
     }
 
     lf_fsksim_t *payload = calloc(1, sizeof(lf_fsksim_t) + size);
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
+
     payload->fchigh = fchigh;
     payload->fclow =  fclow;
     payload->separator = separator;
@@ -1222,9 +1341,10 @@ int CmdLFaskSim(const char *Cmd) {
     bool use_ar = arg_get_lit(ctx, 5);
     bool separator = arg_get_lit(ctx, 6);
 
-    int raw_len = 64;
-    char raw[64] = {0};
+    char raw[65] = {0};
+    int raw_len = sizeof(raw) - 1; // CLIGetStrWithReturn does not guarantee string to be null-terminated
     CLIGetStrWithReturn(ctx, 7, (uint8_t *)raw, &raw_len);
+
     bool verbose = arg_get_lit(ctx, 8);
     CLIParserFree(ctx);
 
@@ -1280,13 +1400,18 @@ int CmdLFaskSim(const char *Cmd) {
     }
 
     size_t size = g_DemodBufferLen;
-    if (size > (PM3_CMD_DATA_SIZE - sizeof(lf_asksim_t))) {
-        PrintAndLogEx(WARNING, "DemodBuffer too long for current implementation - length: %zu - max: %zu", size, PM3_CMD_DATA_SIZE - sizeof(lf_asksim_t));
+    if (size > (g_conn.max_cmd_data_size - sizeof(lf_asksim_t))) {
+        PrintAndLogEx(WARNING, "DemodBuffer too long for current implementation - length: %zu - max: %zu", size, (size_t)(g_conn.max_cmd_data_size - sizeof(lf_asksim_t)));
         PrintAndLogEx(INFO, "Continuing with trimmed down data");
-        size = PM3_CMD_DATA_SIZE - sizeof(lf_asksim_t);
+        size = g_conn.max_cmd_data_size - sizeof(lf_asksim_t);
     }
 
     lf_asksim_t *payload = calloc(1, sizeof(lf_asksim_t) + size);
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
+
     payload->encoding = encoding;
     payload->invert = invert;
     payload->separator = separator;
@@ -1324,17 +1449,22 @@ int CmdLFpskSim(const char *Cmd) {
         arg_lit0("v", "verbose", "verbose output"),
         arg_param_end
     };
+
     CLIExecWithReturn(ctx, Cmd, argtable, true);
+
     bool use_psk1 = arg_get_lit(ctx, 1);
     bool use_psk2 = arg_get_lit(ctx, 2);
     bool use_psk3 = arg_get_lit(ctx, 3);
     bool invert = arg_get_lit(ctx, 4);
+
     uint8_t clk = arg_get_u32_def(ctx, 5, 0);
     uint8_t carrier = arg_get_u32_def(ctx, 6, 2);
-    int raw_len = 64;
-    char raw[64] = {0};
+
+    char raw[65] = {0};
+    int raw_len = sizeof(raw) - 1; // CLIGetStrWithReturn does not guarantee string to be null-terminated
     CLIGetStrWithReturn(ctx, 7, (uint8_t *)raw, &raw_len);
     bool verbose = arg_get_lit(ctx, 8);
+
     CLIParserFree(ctx);
 
     if ((use_psk1 + use_psk2 + use_psk3) > 1) {
@@ -1406,13 +1536,18 @@ int CmdLFpskSim(const char *Cmd) {
     }
 
     size_t size = g_DemodBufferLen;
-    if (size > (PM3_CMD_DATA_SIZE - sizeof(lf_psksim_t))) {
-        PrintAndLogEx(WARNING, "DemodBuffer too long for current implementation - length: %zu - max: %zu", size, PM3_CMD_DATA_SIZE - sizeof(lf_psksim_t));
+    if (size > (g_conn.max_cmd_data_size - sizeof(lf_psksim_t))) {
+        PrintAndLogEx(WARNING, "DemodBuffer too long for current implementation - length: %zu - max: %zu", size, (size_t)(g_conn.max_cmd_data_size - sizeof(lf_psksim_t)));
         PrintAndLogEx(INFO, "Continuing with trimmed down data");
-        size = PM3_CMD_DATA_SIZE - sizeof(lf_psksim_t);
+        size = g_conn.max_cmd_data_size - sizeof(lf_psksim_t);
     }
 
     lf_psksim_t *payload = calloc(1, sizeof(lf_psksim_t) + size);
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
+
     payload->carrier =  carrier;
     payload->invert = invert;
     payload->clock = clk;
@@ -1423,28 +1558,6 @@ int CmdLFpskSim(const char *Cmd) {
     setClockGrid(clk, 0);
 
     return lfsim_wait_check(CMD_LF_PSK_SIMULATE);
-}
-
-int CmdLFSimBidir(const char *Cmd) {
-
-    CLIParserContext *ctx;
-    CLIParserInit(&ctx, "lf simbidir",
-                  "Simulate LF tag with bidirectional data transmission between reader and tag",
-                  "lf simbidir"
-                 );
-
-    void *argtable[] = {
-        arg_param_begin,
-        arg_param_end
-    };
-    CLIExecWithReturn(ctx, Cmd, argtable, true);
-    CLIParserFree(ctx);
-
-    // Set ADC to twice the carrier for a slight supersampling
-    // HACK: not implemented in ARMSRC.
-    PrintAndLogEx(INFO, "Not implemented yet.");
-//    SendCommandMIX(CMD_LF_SIMULATE_BIDIR, 47, 384, 0, NULL, 0);
-    return PM3_SUCCESS;
 }
 
 // ICEMAN,  Verichip is Animal tag.  Tested against correct reader
@@ -1535,45 +1648,77 @@ static bool check_chiptype(bool getDeviceData) {
 
     bool retval = false;
 
-    if (!getDeviceData) return retval;
+    if (getDeviceData == false) {
+        return retval;
+    }
 
     //Save the state of the Graph and Demod Buffers
-    buffer_savestate_t saveState_gb = save_bufferS32(g_GraphBuffer, g_GraphTraceLen);
-    saveState_gb.offset = g_GridOffset;
+    buffer_savestate_t saveState_gb = save_graphbuffer();
     buffer_savestate_t saveState_db = save_buffer8(g_DemodBuffer, g_DemodBufferLen);
     saveState_db.clock = g_DemodClock;
     saveState_db.offset = g_DemodStartIdx;
 
-    //check for em4x05/em4x69 chips first
+    PrintAndLogEx(INFO, "Searching for auth LF and special cases...");
+
+    // check for em4x05/em4x69 chips first
     uint32_t word = 0;
-    if (em4x05_isblock0(&word)) {
-        PrintAndLogEx(SUCCESS, "Chipset detection: " _GREEN_("EM4x05 / EM4x69"));
-        PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf em 4x05`") " commands");
+    if (IfPm3EM4x50() && em4x05_isblock0(&word)) {
+        PrintAndLogEx(SUCCESS, "Chipset... " _GREEN_("EM4x05 / EM4x69"));
+        PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("lf em 4x05") "` commands");
         retval = true;
         goto out;
     }
 
-    //check for t55xx chip...
+    // check for t55xx chip...
     if (tryDetectP1(true)) {
-        PrintAndLogEx(SUCCESS, "Chipset detection: " _GREEN_("T55xx"));
-        PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf t55xx`") " commands");
+        PrintAndLogEx(SUCCESS, "Chipset... " _GREEN_("T55xx"));
+        PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("lf t55xx") "` commands");
         retval = true;
         goto out;
     }
+
+
+    if (IfPm3Hitag()) {
+
+        // Hitag 2
+        if (ht2_read_uid() == PM3_SUCCESS) {
+            PrintAndLogEx(SUCCESS, "Chipset... " _GREEN_("Hitag 2"));
+            PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("lf hitag") "` commands");
+            retval = true;
+            goto out;
+        }
+
+        // Hitag S
+        if (read_hts_uid() == PM3_SUCCESS) {
+            PrintAndLogEx(SUCCESS, "Chipset... " _GREEN_("Hitag 1/S / 82xx"));
+            PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("lf hitag hts") "` commands");
+            retval = true;
+            goto out;
+        }
+
+        // Hitag µ
+        if (read_htu_uid() == PM3_SUCCESS) {
+            PrintAndLogEx(SUCCESS, "Chipset... " _GREEN_("Hitag µ / 8265"));
+            PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("lf hitag htu") "` commands");
+            retval = true;
+            goto out;
+        }
+    }
+
 
 #if !defined ICOPYX
     // check for em4x50 chips
-    if (detect_4x50_block()) {
-        PrintAndLogEx(SUCCESS, "Chipset detection: " _GREEN_("EM4x50"));
-        PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf em 4x50`") " commands");
+    if (IfPm3EM4x50() && detect_4x50_block()) {
+        PrintAndLogEx(SUCCESS, "Chipset... " _GREEN_("EM4x50"));
+        PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("lf em 4x50") "` commands");
         retval = true;
         goto out;
     }
 
     // check for em4x70 chips
-    if (detect_4x70_block()) {
-        PrintAndLogEx(SUCCESS, "Chipset detection: " _GREEN_("EM4x70"));
-        PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf em 4x70`") " commands");
+    if (IfPm3EM4x70() && detect_4x70_block()) {
+        PrintAndLogEx(SUCCESS, "Chipset... " _GREEN_("EM4x70"));
+        PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("lf em 4x70") "` commands");
         retval = true;
         goto out;
     }
@@ -1581,12 +1726,12 @@ static bool check_chiptype(bool getDeviceData) {
 
     PrintAndLogEx(INFO, "Couldn't identify a chipset");
 out:
-    restore_buffer8(saveState_db, g_DemodBuffer);
+    // the detections above demodulate, so the length comes back with the contents
+    g_DemodBufferLen = restore_buffer8(saveState_db, g_DemodBuffer);
     g_DemodClock = saveState_db.clock;
     g_DemodStartIdx = saveState_db.offset;
 
-    restore_bufferS32(saveState_gb, g_GraphBuffer);
-    g_GridOffset = saveState_gb.offset;
+    restore_graphbuffer(saveState_gb);
 
     return retval;
 }
@@ -1630,6 +1775,180 @@ static int check_autocorrelate(const char *prefix, int clock) {
     return PM3_EFAILED;
 }
 
+static int lf_relay_tag(uint64_t samples, uint16_t port) {
+
+    relay_socket_t listen_sock = RELAY_SOCKET_INVALID;
+    relay_socket_t client = relay_listen_accept(port, &listen_sock);
+    if (client == RELAY_SOCKET_INVALID) {
+        return PM3_EFAILED;
+    }
+
+    while (true) {
+
+        if (kbd_enter_pressed()) {
+            SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+            PrintAndLogEx(DEBUG, "\naborted via keyboard!");
+            msleep(300);
+            break;
+        }
+
+        lf_read_internal(false, false, samples, false);
+
+        if ((g_GraphTraceLen > 1000) && (getSignalProperties()->isnoise == false)) {
+
+            PrintAndLogEx(INFO, "Tag detected! Sending %zu samples to Client...", g_GraphTraceLen);
+
+            uint32_t len = (uint32_t)g_GraphTraceLen;
+            if (relay_send_all(client, &len, sizeof(len)) != 0) {
+                break;
+            }
+
+            if (relay_send_all(client, g_GraphBuffer, len * sizeof(int32_t)) != 0) {
+                break;
+            }
+
+            msleep(500);
+        }
+    }
+
+    relay_close(client);
+    relay_close(listen_sock);
+    return PM3_SUCCESS;
+}
+
+static int lf_relay_rdr(const char *ip, uint16_t port) {
+
+    relay_socket_t sock = relay_connect(ip, port);
+    if (sock == RELAY_SOCKET_INVALID) {
+        return PM3_EFAILED;
+    }
+
+    PrintAndLogEx(INFO, "Relay connected to %s:%u", ip, port);
+    PrintAndLogEx(INFO, "Waiting for signal...");
+    PrintAndLogEx(INFO, "Press " _GREEN_("<Enter>") " to exit");
+    PrintAndLogEx(NORMAL, "");
+
+    bool running = true;
+    while (running) {
+
+        if (kbd_enter_pressed()) {
+            SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+            PrintAndLogEx(DEBUG, "\naborted via keyboard!");
+            msleep(300);
+            break;
+        }
+
+        uint32_t incoming_len = 0;
+        int n = relay_recv_all(sock, &incoming_len, sizeof(incoming_len));
+        if (n < 0) {
+            break;
+        }
+
+        if (incoming_len == 0) {
+            continue;
+        }
+
+        if (incoming_len > MAX_GRAPH_TRACE_LEN) {
+            PrintAndLogEx(ERR, "Received length " _RED_("%u") " exceeds buffer size %u, dropping", incoming_len, (uint32_t)MAX_GRAPH_TRACE_LEN);
+            break;
+        }
+
+        PrintAndLogEx(INFO, "Received " _YELLOW_("%u") " samples. Processing...", incoming_len);
+
+        int rx = relay_recv_all(sock, g_GraphBuffer, incoming_len * sizeof(int32_t));
+        if (rx < 0) {
+            PrintAndLogEx(ERR, "Short read receiving sample data");
+            break;
+        }
+
+        // if previous simulation running, we need to break it.
+        SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+        msleep(300);
+
+        g_GraphTraceLen = incoming_len;
+        lf_chk_bitstream();
+        lfsim_upload_gb();
+
+        struct {
+            uint16_t len;
+            uint16_t gap;
+        } PACKED payload;
+        payload.len = (g_GraphTraceLen > UINT16_MAX) ? UINT16_MAX : (uint16_t)g_GraphTraceLen;
+        payload.gap = 0;
+
+        clearCommandBuffer();
+        SendCommandNG(CMD_LF_SIMULATE, (uint8_t *)&payload, sizeof(payload));
+
+        PrintAndLogEx(SUCCESS, "Simulation active.");
+    }
+
+    relay_close(sock);
+    return PM3_SUCCESS;
+}
+
+int CmdLFRelay(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "lf relay",
+                  "Relay LF signal between two Proxmark3 devices over TCP.\n"
+                  "By default it uses PORT 8000 and uses 30000 samples from Graphbuffer\n"
+                  "  --rdr  : Reading device, act as IP client and reads LF tag and sends data\n"
+                  "  --tag  : Simulation device, act as IP server and simulates relayed data\n",
+                  _WHITE_("Device A, reading LF tag, client") "\n"
+                  "lf relay --rdr --ip 192.168.1.141           -> Client, connect to IP 192.168.1.141:8000\n"
+                  "lf relay --rdr --ip 192.168.1.141 -p 18111  -> Client, connect to IP 192.168.1.141:18111 \n\n"
+                  _WHITE_("Device B, simulate LF tag, server") "\n"
+                  "lf relay --tag -p 8111                     -> Server listening port 8111, recv 30000 samples\n"
+                  "lf relay --tag -s 10000                    -> Server listening port 8000, recv 10000 samples\n"
+                 );
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0(NULL, "tag", "Simulation device, act as Server"),
+        arg_lit0(NULL, "rdr", "Sniffing device, act as client"),
+        arg_str0("i", "ip", "<ipaddr>", "Target IPv4 address to send data to. Used with `--rdr`"),
+        arg_u64_0("s", "samples", "<dec>", "Number of samples to collect (def: 30000)"),
+        arg_u64_0("p", "port", "<dec>", "Port number (def: 8000)"),
+        arg_param_end
+    };
+
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+
+    bool is_tag = arg_get_lit(ctx, 1);
+    bool is_rdr = arg_get_lit(ctx, 2);
+
+    int iplen = 0;
+    char ip[256] = { 0 };
+    CLIParamStrToBuf(arg_get_str(ctx, 3), (uint8_t *)ip, sizeof(ip), &iplen);
+
+    uint64_t samples = arg_get_u64_def(ctx, 4, 30000);
+    uint16_t port = arg_get_u32_def(ctx, 5, 8000) & 0xFFFF;
+
+    CLIParserFree(ctx);
+
+    // sanitize
+    if ((is_tag + is_rdr) == 0) {
+        PrintAndLogEx(ERR, "Specify either --tag or --rdr");
+        return PM3_EINVARG;
+    }
+
+    if (is_rdr && (iplen == 0)) {
+        PrintAndLogEx(ERR, "IP address is empty");
+        PrintAndLogEx(HINT, "try `" _YELLOW_("lf relay --rdr --ip <ip>") "`");
+        return PM3_EINVARG;
+    }
+
+    // main
+    if (is_tag) {
+        return lf_relay_tag(samples, port);
+    }
+
+    if (is_rdr) {
+        return lf_relay_rdr(ip, port);
+    }
+
+    return PM3_SUCCESS;
+}
+
 int CmdLFfind(const char *Cmd) {
 
     CLIParserContext *ctx;
@@ -1655,8 +1974,9 @@ int CmdLFfind(const char *Cmd) {
     CLIParserFree(ctx);
     int found = 0;
     bool is_online = (g_session.pm3_present && (use_gb == false));
-    if (is_online)
+    if (is_online) {
         lf_read(false, 30000);
+    }
 
     size_t min_length = 2000;
     if (g_GraphTraceLen < min_length) {
@@ -1674,16 +1994,18 @@ int CmdLFfind(const char *Cmd) {
     PrintAndLogEx(INFO, _CYAN_("Checking for known tags..."));
     PrintAndLogEx(INFO, "");
 
+    int retval = PM3_SUCCESS;
+
     // only run these tests if device is online
     if (is_online) {
 
         if (IfPm3Hitag()) {
-            if (readHitagUid() == PM3_SUCCESS) {
-                PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("Hitag") " found!");
+            if (ht2_read_paxton() == PM3_SUCCESS) {
+                PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("Paxton ID") " found!");
                 if (search_cont) {
                     found++;
                 } else {
-                    return PM3_SUCCESS;
+                    goto out;
                 }
             }
         }
@@ -1726,16 +2048,25 @@ int CmdLFfind(const char *Cmd) {
             }
 
             PrintAndLogEx(NORMAL, "");
-            PrintAndLogEx(FAILED, _RED_("No data found!"));
-            PrintAndLogEx(HINT, "Maybe not an LF tag?");
+
+            // identify chipset
+            bool lf_special_search = check_chiptype(is_online);
+            if (lf_special_search) {
+                found++;
+            } else {
+                PrintAndLogEx(DEBUG, "Automatic chip type detection " _RED_("failed"));
+            }
+
+            if (found == 0) {
+                PrintAndLogEx(HINT, "Hint: try `" _YELLOW_("hf search") "` - since tag might not be LF");
+            }
+
             PrintAndLogEx(NORMAL, "");
             if (search_cont == 0) {
                 return PM3_ESOFT;
             }
         }
     }
-
-    int retval = PM3_SUCCESS;
 
     // ask / man
     if (demodEM410x(true) == PM3_SUCCESS) {
@@ -1940,6 +2271,35 @@ int CmdLFfind(const char *Cmd) {
         }
     }
     */
+    if (demodTrovan(false) == PM3_SUCCESS) {
+        PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("Trovan ID") " found!");
+        if (search_cont) {
+            found++;
+        } else {
+            goto out;
+        }
+    }
+
+    // COTAG last, and only when the capture actually looks like one.
+    if (found == 0) {
+
+        double *sig = pm3_extract(g_GraphBuffer, g_GraphTraceLen, 0, g_GraphTraceLen);
+        if (sig != NULL) {
+
+            const bool switched = pm3_is_switched_carrier(sig, g_GraphTraceLen);
+            free(sig);
+
+            if (switched && demodCOTAG(false, -1, -1) == PM3_SUCCESS) {
+                PrintAndLogEx(SUCCESS, "\nValid " _GREEN_("COTAG ID") " found!");
+                if (search_cont) {
+                    found++;
+                } else {
+                    goto out;
+                }
+            }
+        }
+    }
+
     if (found == 0) {
         PrintAndLogEx(FAILED, _RED_("No known 125/134 kHz tags found!"));
     }
@@ -2080,6 +2440,7 @@ static command_t CommandTable[] = {
     {"securakey",   CmdLFSecurakey,     AlwaysAvailable, "{ Securakey RFIDs...         }"},
     {"ti",          CmdLFTI,            AlwaysAvailable, "{ TI CHIPs...                }"},
     {"t55xx",       CmdLFT55XX,         AlwaysAvailable, "{ T55xx CHIPs...             }"},
+    {"trovan",      CmdLFTrovan,        AlwaysAvailable, "{ Trovan animal IDs...       }"},
     {"viking",      CmdLFViking,        AlwaysAvailable, "{ Viking RFIDs...            }"},
     {"visa2000",    CmdLFVisa2k,        AlwaysAvailable, "{ Visa2000 RFIDs...          }"},
 //    {"zx",          CmdLFZx8211,        AlwaysAvailable, "{ ZX8211 RFIDs...            }"},
@@ -2087,13 +2448,13 @@ static command_t CommandTable[] = {
     {"config",      CmdLFConfig,        IfPm3Lf,         "Get/Set config for LF sampling, bit/sample, decimation, frequency"},
     {"cmdread",     CmdLFCommandRead,   IfPm3Lf,         "Modulate LF reader field to send command before read"},
     {"read",        CmdLFRead,          IfPm3Lf,         "Read LF tag"},
+    {"relay",       CmdLFRelay,         IfPm3Lf,         "LF relay between two pm3 devices (tag/rdr mode)"},
     {"search",      CmdLFfind,          AlwaysAvailable, "Read and Search for valid known tag"},
     {"sim",         CmdLFSim,           IfPm3Lf,         "Simulate LF tag from buffer"},
     {"simask",      CmdLFaskSim,        IfPm3Lf,         "Simulate " _YELLOW_("ASK") " tag"},
     {"simfsk",      CmdLFfskSim,        IfPm3Lf,         "Simulate " _YELLOW_("FSK") " tag"},
     {"simpsk",      CmdLFpskSim,        IfPm3Lf,         "Simulate " _YELLOW_("PSK") " tag"},
 //    {"simnrz",      CmdLFnrzSim,        IfPm3Lf,         "Simulate " _YELLOW_("NRZ") " tag"},
-    {"simbidir",    CmdLFSimBidir,      IfPm3Lf,         "Simulate LF tag (with bidirectional data transmission between reader and tag)"},
     {"sniff",       CmdLFSniff,         IfPm3Lf,         "Sniff LF traffic between reader and tag"},
     {"tune",        CmdLFTune,          IfPm3Lf,         "Continuously measure LF antenna tuning"},
 //    {"vchdemod",    CmdVchDemod,        AlwaysAvailable, "Demodulate samples for VeriChip"},

@@ -1,6 +1,6 @@
 include ../common_arm/Makefile.common
 
-INSTALLFW = proxmark3_recovery.bin
+INSTALLFW = recovery.bin
 ifneq (,$(FWTAG))
     INSTALLFWTAG = $(notdir $(INSTALLFW:%.bin=%-$(FWTAG).bin))
 else
@@ -17,17 +17,26 @@ all: $(BINS)
 	    echo "ERROR: Firmware image too large for your platform! $$FWSIZE > $(FWMAXSIZE)"; \
 		echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; \
 		exit 1; \
-	fi
+	fi; \
+	echo "==================================================================="; \
+	echo "Firmware size: $$FWSIZE bytes ($$((FWSIZE/1024))kb) = $$((FWSIZE*100/$(FWMAXSIZE)))% of $$(($(FWMAXSIZE)/1024))kb"; \
+	echo "==================================================================="
 
 bootrom.bin: ../bootrom/obj/bootrom.elf
 	$(info [=] GEN $@)
-	$(Q)$(CROSS_OBJCOPY) --gap-fill=0xff --pad-to 0x00102000 -O binary $^ $@
+ifeq ($(PLATFORM),PM5)
+	$(info [=] GENA $@)
+	$(Q)$(CROSS_OBJCOPY) --gap-fill=0xff --pad-to 0x08004000 -O binary $^ $@
+else
+	$(info [=] GENB $@)
+	$(Q)$(CROSS_OBJCOPY) --gap-fill=0xff --pad-to 0x00104000 -O binary $^ $@
+endif
 
 fullimage.bin: ../armsrc/obj/fullimage.elf
 	$(info [=] GEN $@)
 	$(Q)$(CROSS_OBJCOPY) --gap-fill=0xff -O binary $^ $@
 
-proxmark3_recovery.bin: bootrom.bin fullimage.bin
+recovery.bin: bootrom.bin fullimage.bin
 	$(info [=] GEN $@)
 	$(Q)cat bootrom.bin fullimage.bin > $@
 

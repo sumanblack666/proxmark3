@@ -160,7 +160,7 @@ static int CmdPrescoReader(const char *Cmd) {
     do {
         lf_read(false, 12000);
         demodPresco(!cm);
-    } while (cm && !kbd_enter_pressed());
+    } while (cm && (kbd_enter_pressed() == false));
     return PM3_SUCCESS;
 }
 
@@ -189,8 +189,8 @@ static int CmdPrescoClone(const char *Cmd) {
     uint8_t hex[4] = {0, 0, 0, 0};
     CLIGetHexWithReturn(ctx, 1, hex, &hex_len);
 
-    uint8_t idstr[11];
-    int slen = 9;
+    uint8_t idstr[10];
+    int slen = sizeof(idstr) - 1; // CLIGetStrWithReturn does not guarantee string to be null-terminated
     memset(idstr, 0x00, sizeof(idstr));
     CLIGetStrWithReturn(ctx, 2, idstr, &slen);
 
@@ -264,8 +264,8 @@ static int CmdPrescoClone(const char *Cmd) {
     } else {
         res = clone_t55xx_tag(blocks, ARRAYLEN(blocks));
     }
-    PrintAndLogEx(SUCCESS, "Done");
-    PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf presco reader`") " to verify");
+    PrintAndLogEx(SUCCESS, "Done!");
+    PrintAndLogEx(HINT, "Hint: Try " _YELLOW_("`lf presco reader`") " to verify");
     return res;
 }
 
@@ -292,8 +292,8 @@ static int CmdPrescoSim(const char *Cmd) {
     uint8_t hex[4] = {0, 0, 0, 0};
     CLIGetHexWithReturn(ctx, 1, hex, &hex_len);
 
-    uint8_t idstr[11];
-    int slen = 9;
+    uint8_t idstr[10] = {0};
+    int slen = sizeof(idstr) - 1; // CLIGetStrWithReturn does not guarantee string to be null-terminated
     memset(idstr, 0x00, sizeof(idstr));
     CLIGetStrWithReturn(ctx, 2, idstr, &slen);
     CLIParserFree(ctx);
@@ -333,6 +333,10 @@ static int CmdPrescoSim(const char *Cmd) {
     getPrescoBits(fullcode, bs);
 
     lf_asksim_t *payload = calloc(1, sizeof(lf_asksim_t) + sizeof(bs));
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
     payload->encoding = 1;
     payload->invert = 0;
     payload->separator = 1;

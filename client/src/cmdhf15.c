@@ -39,32 +39,16 @@
 #include "graph.h"
 #include "crc16.h"              // iso15 crc
 #include "cmddata.h"            // getsamples
-#include "fileutils.h"          // pm3_save_dump
+#include "fileutils.h"          // pm3_save_dump_json, convert_15_dump_format
 #include "cliparser.h"
 #include "util_posix.h"         // msleep
 #include "iso15.h"              // typedef structs / enum
+#include "crypto/originality.h"
 
 #define FrameSOF                Iso15693FrameSOF
 #define Logic0                  Iso15693Logic0
 #define Logic1                  Iso15693Logic1
 #define FrameEOF                Iso15693FrameEOF
-#define CARD_MEMORY_SIZE        4096
-#define HF15_UID_LENGTH         8
-
-#ifndef Crc15
-# define Crc15(data, len)       Crc16ex(CRC_15693, (data), (len))
-#endif
-#ifndef CheckCrc15
-# define CheckCrc15(data, len)  check_crc(CRC_15693, (data), (len))
-#endif
-#ifndef AddCrc15
-#define AddCrc15(data, len)     compute_crc(CRC_15693, (data), (len), (data)+(len), (data)+(len)+1)
-#endif
-
-#ifndef ISO15_RAW_LEN
-#define ISO15_RAW_LEN(x)  (sizeof(iso15_raw_cmd_t) + (x))
-#endif
-
 
 #ifndef ISO15_ERROR_HANDLING_RESPONSE
 #define ISO15_ERROR_HANDLING_RESPONSE { \
@@ -158,6 +142,8 @@ static const productName_t uidmapping[] = {
     { 0xE004010000000000LL, 0xFFFFFF1800000000LL, "NXP (Philips); IC SL2 ICS20/ICS21 " AEND "( " _CYAN_("SLI") " )" },
     { 0xE004011000000000LL, 0xFFFFFF1800000000LL, "NXP (Philips); IC SL2 ICS2002/ICS2102 " AEND "( " _CYAN_("SLIX") " )" },
     { 0xE004010800000000LL, 0xFFFFFF1800000000LL, "NXP (Philips); IC SL2 ICS2602 " AEND "( " _CYAN_("SLIX2") " )" },
+    { 0xE004011800000000LL, 0xFFFFFF1800000000LL, "NXP (Philips); ICODE DNA"},
+    { 0xE004012000000000LL, 0xFFFFFF7800000000LL, "NXP (Philips); ICODE 3"},
     { 0xE004020000000000LL, 0xFFFFFF1000000000LL, "NXP (Philips); IC SL2 ICS53/ICS54 " AEND "( " _CYAN_("SLI-S") " )" },
     { 0xE004021000000000LL, 0xFFFFFF1000000000LL, "NXP (Philips); ICS5302/ICS5402 " AEND "( " _CYAN_("SLIX-S") " )" },
     { 0xE004030000000000LL, 0xFFFFFF1000000000LL, "NXP (Philips); IC SL2 ICS50/ICS51 " AEND "( " _CYAN_("SLI-L") " )" },
@@ -282,120 +268,35 @@ static int CmdHF15Help(const char *Cmd);
 
 static int nxp_15693_print_signature(uint8_t *uid, uint8_t *signature) {
 
-#define PUBLIC_ECDA_KEYLEN 33
-    const ecdsa_publickey_t nxp_15693_public_keys[] = {
-        {"NXP MIFARE Classic MFC1C14_x",   "044F6D3F294DEA5737F0F46FFEE88A356EED95695DD7E0C27A591E6F6F65962BAF"},
-        {"MIFARE Classic / QL88",          "046F70AC557F5461CE5052C8E4A7838C11C7A236797E8A0730A101837C004039C2"},
-        {"NXP ICODE DNA, ICODE SLIX2",     "048878A2A2D3EEC336B4F261A082BD71F9BE11C4E2E896648B32EFA59CEA6E59F0"},
-        {"NXP Public key",                 "04A748B6A632FBEE2C0897702B33BEA1C074998E17B84ACA04FF267E5D2C91F6DC"},
-        {"NXP Ultralight Ev1",             "0490933BDCD6E99B4E255E3DA55389A827564E11718E017292FAF23226A96614B8"},
-        {"NXP NTAG21x (2013)",             "04494E1A386D3D3CFE3DC10E5DE68A499B1C202DB5B132393E89ED19FE5BE8BC61"},
-        {"MIKRON Public key",              "04F971EDA742A4A80D32DCF6A814A707CC3DC396D35902F72929FDCD698B3468F2"},
-        {"VivoKey Spark1 Public key",      "04D64BB732C0D214E7EC580736ACF847284B502C25C0F7F2FA86AACE1DADA4387A"},
-        {"TruST25 (ST) key 01?",           "041D92163650161A2548D33881C235D0FB2315C2C31A442F23C87ACF14497C0CBA"},
-        {"TruST25 (ST) key 04?",           "04101E188A8B4CDDBC62D5BC3E0E6850F0C2730E744B79765A0E079907FBDB01BC"},
-    };
-    /*
-        uint8_t nxp_15693_public_keys[][PUBLIC_ECDA_KEYLEN] = {
-            // ICODE SLIX2 / DNA
-            {
-                0x04, 0x88, 0x78, 0xA2, 0xA2, 0xD3, 0xEE, 0xC3,
-                0x36, 0xB4, 0xF2, 0x61, 0xA0, 0x82, 0xBD, 0x71,
-                0xF9, 0xBE, 0x11, 0xC4, 0xE2, 0xE8, 0x96, 0x64,
-                0x8B, 0x32, 0xEF, 0xA5, 0x9C, 0xEA, 0x6E, 0x59, 0xF0
-            },
-            // unknown. Needs identification
-            {
-                0x04, 0x4F, 0x6D, 0x3F, 0x29, 0x4D, 0xEA, 0x57,
-                0x37, 0xF0, 0xF4, 0x6F, 0xFE, 0xE8, 0x8A, 0x35,
-                0x6E, 0xED, 0x95, 0x69, 0x5D, 0xD7, 0xE0, 0xC2,
-                0x7A, 0x59, 0x1E, 0x6F, 0x6F, 0x65, 0x96, 0x2B, 0xAF
-            },
-            // unknown. Needs identification
-            {
-                0x04, 0xA7, 0x48, 0xB6, 0xA6, 0x32, 0xFB, 0xEE,
-                0x2C, 0x08, 0x97, 0x70, 0x2B, 0x33, 0xBE, 0xA1,
-                0xC0, 0x74, 0x99, 0x8E, 0x17, 0xB8, 0x4A, 0xCA,
-                0x04, 0xFF, 0x26, 0x7E, 0x5D, 0x2C, 0x91, 0xF6, 0xDC
-            },
-            // manufacturer public key
-            {
-                0x04, 0x6F, 0x70, 0xAC, 0x55, 0x7F, 0x54, 0x61,
-                0xCE, 0x50, 0x52, 0xC8, 0xE4, 0xA7, 0x83, 0x8C,
-                0x11, 0xC7, 0xA2, 0x36, 0x79, 0x7E, 0x8A, 0x07,
-                0x30, 0xA1, 0x01, 0x83, 0x7C, 0x00, 0x40, 0x39, 0xC2
-            },
-            // MIKRON public key.
-            {
-                0x04, 0xf9, 0x71, 0xed, 0xa7, 0x42, 0xa4, 0xa8,
-                0x0d, 0x32, 0xdc, 0xf6, 0xa8, 0x14, 0xa7, 0x07,
-                0xcc, 0x3d, 0xc3, 0x96, 0xd3, 0x59, 0x02, 0xf7,
-                0x29, 0x29, 0xfd, 0xcd, 0x69, 0x8b, 0x34, 0x68, 0xf2
-            }
-        };
-    */
-
-    uint8_t revuid[HF15_UID_LENGTH] = {0};
-    reverse_array_copy(uid, sizeof(revuid), revuid);
-
-    uint8_t revsign[32] = {0};
-    reverse_array_copy(signature, sizeof(revsign), revsign);
-
-    uint8_t i;
     int reason = 0;
-    bool is_valid = false;
-    for (i = 0; i < ARRAYLEN(nxp_15693_public_keys); i++) {
-
-        int dl = 0;
-        uint8_t key[PUBLIC_ECDA_KEYLEN];
-        param_gethex_to_eol(nxp_15693_public_keys[i].value, 0, key, PUBLIC_ECDA_KEYLEN, &dl);
-
-        int res = ecdsa_signature_r_s_verify(MBEDTLS_ECP_DP_SECP128R1, key, uid, 8, signature, 32, false);
-        is_valid = (res == 0);
-        if (is_valid) {
-            reason = 1;
-            break;
-        }
-
+    int index = originality_check_verify(uid, 8, signature, 32, PK_15);
+    if (index >= 0) {
+        reason = 1;
+    } else {
         // try with sha256
-        res = ecdsa_signature_r_s_verify(MBEDTLS_ECP_DP_SECP128R1, key, uid, 8, signature, 32, true);
-        is_valid = (res == 0);
-        if (is_valid) {
+        index = originality_check_verify_ex(uid, 8, signature, 32, PK_15, false, true);
+        if (index >= 0) {
             reason = 2;
-            break;
-        }
-
-        // try with reversed uid / signature
-        res = ecdsa_signature_r_s_verify(MBEDTLS_ECP_DP_SECP128R1, key, revuid, sizeof(revuid), revsign, sizeof(revsign), false);
-        is_valid = (res == 0);
-        if (is_valid) {
-            reason = 3;
-            break;
-        }
-
-        // try with sha256
-        res = ecdsa_signature_r_s_verify(MBEDTLS_ECP_DP_SECP128R1, key, revuid, sizeof(revuid), revsign, sizeof(revsign), true);
-        is_valid = (res == 0);
-        if (is_valid) {
-            reason = 4;
-            break;
+        } else {
+            // try with reversed uid / signature
+            index = originality_check_verify_ex(uid, 8, signature, 32, PK_15, true, false);
+            if (index >= 0) {
+                reason = 3;
+            } else {
+                // try with sha256 and reversed uid / signature
+                index = originality_check_verify_ex(uid, 8, signature, 32, PK_15, true, true);
+                if (index >= 0) {
+                    reason = 4;
+                }
+            }
         }
     }
 
-    PrintAndLogEx(NORMAL, "");
-    PrintAndLogEx(INFO, "--- " _CYAN_("Tag Signature"));
-    if (is_valid == false || i == ARRAYLEN(nxp_15693_public_keys)) {
-        PrintAndLogEx(INFO, "    Elliptic curve parameters: NID_secp128r1");
-        PrintAndLogEx(INFO, "             TAG IC Signature: %s", sprint_hex_inrow(signature, 32));
-        PrintAndLogEx(SUCCESS, "       Signature verification: " _RED_("failed"));
-        return PM3_ESOFT;
+    int ret = originality_check_print(signature, 32, index);
+    if (ret != PM3_SUCCESS) {
+        return ret;
     }
 
-    PrintAndLogEx(INFO, " IC signature public key name: " _GREEN_("%s"), nxp_15693_public_keys[i].desc);
-    PrintAndLogEx(INFO, "IC signature public key value: %s", nxp_15693_public_keys[i].value);
-    PrintAndLogEx(INFO, "    Elliptic curve parameters: NID_secp128r1");
-    PrintAndLogEx(INFO, "             TAG IC Signature: %s", sprint_hex_inrow(signature, 32));
-    PrintAndLogEx(SUCCESS, "       Signature verification: " _GREEN_("successful"));
     switch (reason) {
         case 1:
             PrintAndLogEx(INFO, "                  Params used: UID and signature, plain");
@@ -416,14 +317,15 @@ static int nxp_15693_print_signature(uint8_t *uid, uint8_t *signature) {
 // get a product description based on the UID
 // uid[8] tag uid
 // returns description of the best match
-static const char *getTagInfo_15(const uint8_t *uid) {
+static void printTagInfo_15(const uint8_t *uid) {
     if (uid == NULL) {
-        return "";
+        return;
     }
 
     uint64_t myuid, mask;
     int i = 0, best = -1;
     memcpy(&myuid, uid, sizeof(uint64_t));
+    // find first best match
     while (uidmapping[i].mask > 0) {
         if (uidmapping[i].mask > 64) {
             mask = uidmapping[i].mask;
@@ -441,10 +343,23 @@ static const char *getTagInfo_15(const uint8_t *uid) {
         }
         i++;
     }
+    if (best >= 0) {
+        i = 0;
+        while (uidmapping[i].mask > 0) {
+            if (uidmapping[i].mask > 64) {
+                mask = uidmapping[i].mask;
+            } else {
+                mask = (~0ULL) << (64 - uidmapping[i].mask);
+            }
+            if (((myuid & mask) == uidmapping[i].uid) && (uidmapping[i].mask == uidmapping[best].mask)) {
+                PrintAndLogEx(SUCCESS, "TYPE MATCH " _YELLOW_("%s"), uidmapping[i].desc);
+            }
+            i++;
+        }
+    } else {
+        PrintAndLogEx(SUCCESS, "TYPE...... " _YELLOW_("%s"), uidmapping[i].desc);
+    }
 
-    if (best >= 0)
-        return uidmapping[best].desc;
-    return uidmapping[i].desc;
 }
 
 // return a clear-text message to an errorcode
@@ -501,7 +416,7 @@ static int getUID(bool verbose, bool loop, uint8_t *buf) {
     uint8_t approxlen = 5;
     iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + approxlen);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -531,7 +446,8 @@ static int getUID(bool verbose, bool loop, uint8_t *buf) {
                 if (verbose) {
                     PrintAndLogEx(NORMAL, "");
                     PrintAndLogEx(SUCCESS, "UID.... " _GREEN_("%s"), iso15693_sprintUID(NULL, buf));
-                    PrintAndLogEx(SUCCESS, "TYPE... " _YELLOW_("%s"), getTagInfo_15(buf));
+                    PrintAndLogEx(SUCCESS, "DSFID.. %02X", resp.data.asBytes[1]);
+                    printTagInfo_15(buf);
                     PrintAndLogEx(NORMAL, "");
                 }
                 res = PM3_SUCCESS;
@@ -549,11 +465,129 @@ static int getUID(bool verbose, bool loop, uint8_t *buf) {
 
 // used with 'hf search'
 bool readHF15Uid(bool loop, bool verbose) {
-    uint8_t uid[HF15_UID_LENGTH] = {0};
+    uint8_t uid[ISO15693_UID_LENGTH] = {0};
     if (getUID(verbose, loop, uid) != PM3_SUCCESS) {
         return false;
     }
     return true;
+}
+
+// Per-slot result for 16-slot inventory
+typedef struct {
+    uint8_t slot;
+    uint8_t status;      // 0=empty, 1=valid, 2=collision (CRC fail)
+    uint8_t data[ISO15693_MAX_SLOT_RESPONSE];
+    uint8_t data_len;
+} iso15_inventory_result_t;
+
+// Performs a 16-slot (or 1-slot) inventory round with arbitrary command bytes.
+// raw_cmd: full ISO 15693 command bytes (flags + cmd_code + params), WITHOUT CRC
+// raw_len: length of raw_cmd
+// add_crc: whether to append CRC15
+// fast: true for high-speed (1 out of 4), false for low-speed (1 out of 256)
+// keep_field_on: if true, keep RF field active after command (for multi-round tree walking)
+// results: caller-provided array of iso15_inventory_result_t[16]
+// num_found: output - number of slots with valid (CRC-OK) responses
+// Returns PM3_SUCCESS or error code
+static int perform_iso15_inventory(
+    const uint8_t *raw_cmd,
+    uint16_t raw_len,
+    bool add_crc,
+    bool fast,
+    bool keep_field_on,
+    iso15_inventory_result_t *results,
+    uint8_t *num_found
+) {
+    *num_found = 0;
+    memset(results, 0, sizeof(iso15_inventory_result_t) * ISO15693_MAX_SLOTS);
+
+    uint16_t cmdlen = raw_len + (add_crc ? 2 : 0);
+    iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + cmdlen);
+    if (packet == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
+
+    memcpy(packet->raw, raw_cmd, raw_len);
+    packet->rawlen = raw_len;
+    if (add_crc) {
+        AddCrc15(packet->raw, raw_len);
+        packet->rawlen += 2;
+    }
+    packet->flags = ISO15_CONNECT | ISO15_READ_RESPONSE;
+    if (fast) {
+        packet->flags |= ISO15_HIGH_SPEED;
+    }
+    if (keep_field_on) {
+        packet->flags |= ISO15_NO_DISCONNECT;
+    }
+
+    // Determine if this is a 16-slot request
+    bool is_inventory = (raw_cmd[0] & ISO15_REQ_INVENTORY) != 0;
+    bool is_16slot = is_inventory && ((raw_cmd[0] & ISO15_REQINV_SLOT1) == 0);
+    uint8_t num_slots = is_16slot ? 16 : 1;
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_ISO15693_COMMAND, (uint8_t *)packet, ISO15_RAW_LEN(packet->rawlen));
+    free(packet);
+
+    PacketResponseNG resp;
+    if (!WaitForResponseTimeout(CMD_HF_ISO15693_COMMAND, &resp, 4000)) {
+        PrintAndLogEx(WARNING, "timeout while waiting for reply");
+        return PM3_ETIMEOUT;
+    }
+    if (resp.status != PM3_SUCCESS) {
+        return resp.status;
+    }
+
+    if (is_16slot) {
+        // Parse multi-slot response (iso15_inventory_response_t format)
+        if (resp.length < 1 + (num_slots * 2)) {
+            PrintAndLogEx(WARNING, "response too short for 16-slot inventory");
+            return PM3_ESOFT;
+        }
+
+        iso15_inventory_response_t *inv = (iso15_inventory_response_t *)resp.data.asBytes;
+        uint16_t offset = 0;
+
+        for (uint8_t s = 0; s < num_slots; s++) {
+            results[s].slot = s;
+            results[s].status = inv->slots[s].status;
+            results[s].data_len = inv->slots[s].len;
+
+            if (inv->slots[s].len > 0 && inv->slots[s].len <= sizeof(results[s].data)) {
+                memcpy(results[s].data, inv->data + offset, inv->slots[s].len);
+                offset += inv->slots[s].len;
+
+                // Validate CRC to distinguish valid response from collision
+                if (inv->slots[s].status == 1) {
+                    if (inv->slots[s].len >= 4 && CheckCrc15(results[s].data, inv->slots[s].len)) {
+                        (*num_found)++;
+                    } else {
+                        results[s].status = 2; // CRC fail = collision
+                    }
+                }
+            }
+        }
+    } else {
+        // Single-slot: parse as normal single response
+        results[0].slot = 0;
+        if (resp.length >= 12 && CheckCrc15(resp.data.asBytes, resp.length)) {
+            results[0].status = 1;
+            results[0].data_len = MIN(resp.length, sizeof(results[0].data));
+            memcpy(results[0].data, resp.data.asBytes, results[0].data_len);
+            (*num_found)++;
+        } else if (resp.length > 0) {
+            results[0].status = 2; // got data but CRC failed
+            results[0].data_len = MIN(resp.length, sizeof(results[0].data));
+            memcpy(results[0].data, resp.data.asBytes, results[0].data_len);
+        } else {
+            results[0].status = 0;
+            results[0].data_len = 0;
+        }
+    }
+
+    return PM3_SUCCESS;
 }
 
 // adds 6
@@ -604,7 +638,7 @@ static int CmdHF15Demod(const char *Cmd) {
 
     if (g_GraphTraceLen < 1000) {
         PrintAndLogEx(FAILED, "Too few samples in GraphBuffer");
-        PrintAndLogEx(HINT, "Run " _YELLOW_("`hf 15 samples`") " to collect and download data");
+        PrintAndLogEx(HINT, "Hint: Run `" _YELLOW_("hf 15 samples") "` to collect and download data");
         return PM3_ESOFT;
     }
 
@@ -729,7 +763,7 @@ static int CmdHF15Samples(const char *Cmd) {
 
     getSamples(0, true);
 
-    PrintAndLogEx(HINT, "Try `" _YELLOW_("hf 15 demod") "` to decode signal");
+    PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf 15 demod") "` to decode signal");
     PrintAndLogEx(INFO, "Done!");
     return PM3_SUCCESS;
 }
@@ -740,10 +774,10 @@ static int NxpTestEAS(const uint8_t *uid) {
         return PM3_EINVARG;
     }
 
-    uint8_t approxlen = 3 + HF15_UID_LENGTH + 2;
+    uint8_t approxlen = 3 + ISO15693_UID_LENGTH + 2;
     iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + approxlen);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -752,8 +786,8 @@ static int NxpTestEAS(const uint8_t *uid) {
     packet->raw[packet->rawlen++] = ISO15693_EAS_ALARM;
     packet->raw[packet->rawlen++] = 0x04; // IC manufacturer code
 
-    memcpy(packet->raw + packet->rawlen, uid, HF15_UID_LENGTH); // add UID
-    packet->rawlen += HF15_UID_LENGTH;
+    memcpy(packet->raw + packet->rawlen, uid, ISO15693_UID_LENGTH); // add UID
+    packet->rawlen += ISO15693_UID_LENGTH;
 
     AddCrc15(packet->raw,  packet->rawlen);
     packet->rawlen += 2;
@@ -795,10 +829,10 @@ static int NxpCheckSig(uint8_t *uid) {
         return PM3_EINVARG;
     }
 
-    uint8_t approxlen = 3 + HF15_UID_LENGTH + 2;
+    uint8_t approxlen = 3 + ISO15693_UID_LENGTH + 2;
     iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + approxlen);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -808,8 +842,8 @@ static int NxpCheckSig(uint8_t *uid) {
     packet->raw[packet->rawlen++] = ISO15693_READ_SIGNATURE;
     packet->raw[packet->rawlen++] = 0x04; // IC manufacturer code
 
-    memcpy(packet->raw + packet->rawlen, uid, HF15_UID_LENGTH); // add UID
-    packet->rawlen += HF15_UID_LENGTH;
+    memcpy(packet->raw + packet->rawlen, uid, ISO15693_UID_LENGTH); // add UID
+    packet->rawlen += ISO15693_UID_LENGTH;
 
     AddCrc15(packet->raw,  packet->rawlen);
     packet->rawlen += 2;
@@ -852,7 +886,7 @@ static int NxpSysInfo(uint8_t *uid) {
     uint8_t approxlen = 13;
     iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + approxlen);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -862,7 +896,7 @@ static int NxpSysInfo(uint8_t *uid) {
     packet->raw[packet->rawlen++] = 0x04; // IC manufacturer code
 
     memcpy(packet->raw + 3, uid, 8); // add UID
-    packet->rawlen += HF15_UID_LENGTH;
+    packet->rawlen += ISO15693_UID_LENGTH;
 
     AddCrc15(packet->raw,  packet->rawlen);
     packet->rawlen += 2;
@@ -895,6 +929,8 @@ static int NxpSysInfo(uint8_t *uid) {
     PrintAndLogEx(INFO, "    Raw............ %s", sprint_hex(d, 8));
     PrintAndLogEx(INFO, "");
     PrintAndLogEx(INFO, _CYAN_(" Password protection configuration"));
+
+    PrintAndLogEx(INFO, "    Page prot. ptr. " _YELLOW_("%d"), d[1]);
 
     PrintAndLogEx(INFO, "    Page L read.... %s"
                   , (d[2] & 0x01) ?  _RED_("password") : _GREEN_("no password")
@@ -963,6 +999,82 @@ static int NxpSysInfo(uint8_t *uid) {
     return PM3_SUCCESS;
 }
 
+static int StCheckSig(uint8_t *uid) {
+    // request to be sent to device/card
+    uint16_t approxlen = 2 + ISO15693_UID_LENGTH + 1 + 2;
+    iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + approxlen);
+    if (packet == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
+
+    // ISO15693 Protocol params
+    packet->raw[packet->rawlen++] = arg_get_raw_flag(ISO15693_UID_LENGTH, false, false, false);
+    packet->raw[packet->rawlen++] = ISO15693_READBLOCK;
+
+    // add UID (scan, uid)
+    memcpy(packet->raw + packet->rawlen, uid, ISO15693_UID_LENGTH);
+    packet->rawlen += ISO15693_UID_LENGTH;
+    packet->flags = (ISO15_CONNECT | ISO15_READ_RESPONSE | ISO15_NO_DISCONNECT);
+
+    uint16_t blkoff = packet->rawlen;
+    char signature_hex[65] = {0};
+
+    for (int i = 0; i < 17; i++) {
+
+        // reset rawlength counter
+        packet->rawlen = blkoff;
+
+        // block no
+        packet->raw[packet->rawlen++] = 0x3F + i;
+
+        // add crc
+        AddCrc15(packet->raw,  packet->rawlen);
+        packet->rawlen += 2;
+
+        clearCommandBuffer();
+        SendCommandNG(CMD_HF_ISO15693_COMMAND, (uint8_t *)packet, ISO15_RAW_LEN(packet->rawlen));
+        PacketResponseNG resp;
+        if (WaitForResponseTimeout(CMD_HF_ISO15693_COMMAND, &resp, 2000) == false) {
+            PrintAndLogEx(DEBUG, "iso15693 timeout");
+            free(packet);
+            DropField();
+            return PM3_ETIMEOUT;
+        }
+
+        ISO15_ERROR_HANDLING_RESPONSE
+        uint8_t *d = resp.data.asBytes;
+        ISO15_ERROR_HANDLING_CARD_RESPONSE(d, resp.length)
+
+        if (i == 0) {
+
+            if (memcmp(d + 1, "K04S", 4) != 0) {
+                // No signature
+                free(packet);
+                return PM3_ESOFT;
+            }
+
+        } else {
+            memcpy(signature_hex + ((i - 1) * 4), d + 1, 4);
+        }
+        packet->flags = (ISO15_READ_RESPONSE | ISO15_NO_DISCONNECT);
+    }
+
+    free(packet);
+    DropField();
+
+    uint8_t signature[16];
+    size_t signature_len = 0;
+    hexstr_to_byte_array(signature_hex, signature, &signature_len);
+
+    uint8_t uid_swap[ISO15693_UID_LENGTH];
+    reverse_array_copy(uid, ISO15693_UID_LENGTH, uid_swap);
+
+    int index = originality_check_verify_ex(uid_swap, ISO15693_UID_LENGTH, signature, signature_len, PK_ST25TV, false, true);
+    PrintAndLogEx(NORMAL, "");
+    return originality_check_print(signature, signature_len, index);
+}
+
 /**
  * Commandline handling: HF15 CMD SYSINFO
  * get system information from tag/VICC
@@ -983,7 +1095,7 @@ static int CmdHF15Info(const char *Cmd) {
 
     CLIExecWithReturn(ctx, Cmd, argtable, true);
 
-    uint8_t uid[HF15_UID_LENGTH];
+    uint8_t uid[ISO15693_UID_LENGTH];
     int uidlen = 0;
     CLIGetHexWithReturn(ctx, 1, uid, &uidlen);
     bool unaddressed = arg_get_lit(ctx, 2);
@@ -1000,7 +1112,7 @@ static int CmdHF15Info(const char *Cmd) {
     }
 
     // default fallback to scan for tag.
-    if (unaddressed == false && uidlen != HF15_UID_LENGTH) {
+    if (unaddressed == false && uidlen != ISO15693_UID_LENGTH) {
         scan = true;
     }
 
@@ -1011,7 +1123,7 @@ static int CmdHF15Info(const char *Cmd) {
 
     iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + approxlen);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -1027,10 +1139,10 @@ static int CmdHF15Info(const char *Cmd) {
                 free(packet);
                 return PM3_EINVARG;
             }
-            uidlen = HF15_UID_LENGTH;
+            uidlen = ISO15693_UID_LENGTH;
         }
 
-        if (uidlen == HF15_UID_LENGTH) {
+        if (uidlen == ISO15693_UID_LENGTH) {
             // add UID (scan, uid)
             memcpy(packet->raw + packet->rawlen, uid, uidlen);
             packet->rawlen += uidlen;
@@ -1071,7 +1183,7 @@ static int CmdHF15Info(const char *Cmd) {
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(INFO, "--- " _CYAN_("Tag Information") " ---------------------------");
     PrintAndLogEx(SUCCESS, "UID....... " _GREEN_("%s"), iso15693_sprintUID(NULL, uid));
-    PrintAndLogEx(SUCCESS, "TYPE...... " _YELLOW_("%s"), getTagInfo_15(d + 2));
+    printTagInfo_15(d + 2);
     PrintAndLogEx(SUCCESS, "SYSINFO... %s", sprint_hex(d, resp.length - 2));
 
     // DSFID
@@ -1100,28 +1212,57 @@ static int CmdHF15Info(const char *Cmd) {
         PrintAndLogEx(SUCCESS, "    " _YELLOW_("%u") " ( or " _YELLOW_("%u") " ) bytes/blocks x " _YELLOW_("%u") " blocks", size + 1, size, blocks);
         PrintAndLogEx(SUCCESS, "    " _YELLOW_("%u") " total bytes", ((size + 1) * blocks));
     } else {
-        PrintAndLogEx(SUCCESS, "    N/A");
+        PrintAndLogEx(SUCCESS, "    n/a");
     }
 
     // Check if SLIX2 and attempt to get NXP System Information
     PrintAndLogEx(DEBUG, "Byte 6 :: %02x   Byte 7 :: %02x   Byte 8 :: %02x", d[6], d[7], d[8]);
-    // SLIX2 uses xxx0 1xxx format on d[6] of UID
-    uint8_t nxp_version = d[6] & 0x18;
-    PrintAndLogEx(DEBUG, "NXP Version: %02x", nxp_version);
 
-    if (d[8] == 0x04 && d[7] == 0x01 && nxp_version == 0x08) {
-        PrintAndLogEx(DEBUG, "SLIX2 Detected, getting NXP System Info");
-        return NxpSysInfo(uid);
+    if (d[8] == 0x04) {
+        // NXP
 
-    } else if (d[8] == 0x04 && d[7] == 0x01 && nxp_version == 0x18) { // If it is an NTAG 5
-        PrintAndLogEx(DEBUG, "NTAG 5 Detected, getting NXP System Info");
-        return NxpSysInfo(uid);
+        // from: SL2S6002_SDS
+        // Bit 37 Bit 36 ICODE Type
+        // -------------------------
+        // 0      0      ICODE SLI
+        // 1      0      ICODE SLIX
+        // 0      1      ICODE SLIX2
+        // 1      1      ICODE DNA
 
-    } else if (d[8] == 0x04 && (d[7] == 0x01 || d[7] == 0x02 || d[7] == 0x03)) { // If SLI, SLIX, SLIX-l, or SLIX-S check EAS status
-        PrintAndLogEx(DEBUG, "SLI, SLIX, SLIX-L, or SLIX-S Detected checking EAS status");
-        return NxpTestEAS(uid);
+        // SLIX2 uses xxx0 1xxx format on d[6] of UID
+        uint8_t nxp_version = d[6] & 0x18;
+        PrintAndLogEx(DEBUG, "NXP Version: %02x", nxp_version);
+
+        // from: SL2S3103
+        // Bit 39 Bit 38 Bit 37 Bit 36 ICODE Type
+        // --------------------------------------
+        // 0      1      0      0      ICODE 3
+        // --> it can be mismached with a ICODE SLI, but lets assume Bit 39 & Bit 38 at 0 when ICODE SLI*/DNA...
+
+        if (d[7] == 0x01 && nxp_version == 0x08) {
+            PrintAndLogEx(DEBUG, "SLIX2 Detected, getting NXP System Info");
+            return NxpSysInfo(uid);
+        } else if (d[7] == 0x01 && nxp_version == 0x18) { // If it is an NTAG 5 / ICODE DNA
+            PrintAndLogEx(DEBUG, "NTAG 5 / ICODE DNA Detected, getting NXP System Info");
+            return NxpSysInfo(uid);
+        } else if (d[7] == 0x01 && ((d[6] & 0x78) == 0x20)) { // If it is an NTAG ICODE 3
+            PrintAndLogEx(DEBUG, "ICODE 3 Detected, getting NXP System Info");
+            return NxpSysInfo(uid);
+        } else if ((d[7] == 0x01 || d[7] == 0x02 || d[7] == 0x03)) { // If SLI, SLIX, SLIX-l, or SLIX-S check EAS status
+            PrintAndLogEx(DEBUG, "SLI, SLIX, SLIX-L, or SLIX-S Detected checking EAS status");
+            return NxpTestEAS(uid);
+        }
+    } else if (d[8] == 0x02) {
+        // ST, check d[7]:
+        // ST25TV512C/ST25TV02KC  0x08
+        // ST25TV512/ST25TV02K    0x23
+        // ST25TV04K-P            0x35
+        // ST25TV16K/ST25TV64K    0x48
+        if (d[7] == 0x08) {
+            PrintAndLogEx(DEBUG, "ST25TVxC Detected, getting ST Signature");
+            return StCheckSig(uid);
+        }
     }
-
     PrintAndLogEx(NORMAL, "");
     return PM3_SUCCESS;
 }
@@ -1146,32 +1287,348 @@ static int CmdHF15Sniff(const char *Cmd) {
 
     WaitForResponse(CMD_HF_ISO15693_SNIFF, &resp);
 
-    PrintAndLogEx(HINT, "Try `" _YELLOW_("hf 15 list") "` to view captured tracelog");
-    PrintAndLogEx(HINT, "Try `" _YELLOW_("trace save -h") "` to save tracelog for later analysing");
+    PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf 15 list") "` to view captured tracelog");
+    PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("trace save -h") "` to save tracelog for later analysing");
     PrintAndLogEx(INFO, "Done!");
+    return PM3_SUCCESS;
+}
+
+// Single 1-slot inventory round with optional AFI and speed control
+static int reader_single_tag(bool fast, bool loop, uint8_t *afi_buf, int afi_len) {
+
+    do {
+        uint8_t raw_cmd[8] = {0};
+        uint16_t raw_len = 0;
+
+        raw_cmd[raw_len] = ISO15_REQ_SUBCARRIER_SINGLE
+                           | ISO15_REQ_DATARATE_HIGH
+                           | ISO15_REQ_INVENTORY
+                           | ISO15_REQINV_SLOT1;
+        if (afi_len > 0)
+            raw_cmd[raw_len] |= ISO15_REQINV_AFI;
+        raw_len++;
+
+        raw_cmd[raw_len++] = ISO15693_INVENTORY;
+
+        if (afi_len > 0)
+            raw_cmd[raw_len++] = afi_buf[0];
+
+        raw_cmd[raw_len++] = 0; // mask length = 0
+
+        iso15_inventory_result_t results[ISO15693_MAX_SLOTS] = {{0}};
+        uint8_t num_found = 0;
+
+        int res = perform_iso15_inventory(raw_cmd, raw_len, true, fast, false, results, &num_found);
+        if (res == PM3_SUCCESS && num_found > 0 && results[0].status == 1 && results[0].data_len >= 12) {
+            uint8_t uid[8];
+            memcpy(uid, results[0].data + 2, 8);
+
+            PrintAndLogEx(NORMAL, "");
+            PrintAndLogEx(SUCCESS, "UID.... " _GREEN_("%s"), iso15693_sprintUID(NULL, uid));
+            PrintAndLogEx(SUCCESS, "DSFID.. %02X", results[0].data[1]);
+            printTagInfo_15(uid);
+            PrintAndLogEx(NORMAL, "");
+
+            if (!loop)
+                return PM3_SUCCESS;
+        }
+    } while (loop && kbd_enter_pressed() == false);
+
+    return PM3_SUCCESS;
+}
+
+// 16-slot anti-collision tree walking to discover all tags in the field
+// One persistent row per UID ever seen during a continuous `hf 15 reader --all -@`.
+typedef struct {
+    uint8_t  uid[8];
+    uint8_t  dsfid;
+    uint64_t last_seen_ms;
+    bool     present;
+} iso15_seen_tag_t;
+
+// Redraw the presence table in place via cursor-up. Printed with newlines BETWEEN rows but none
+// after the last, so the cursor never drops below the bottom row (a trailing newline at the
+// screen bottom would scroll and leave the header behind). To refresh, return to the top of the
+// block (\r + cursor-up) and clear to end of screen. All printf, so header/data columns align.
+static void iso15_render_presence_table(const iso15_seen_tag_t *seen, int n,
+                                        bool inplace, bool *first_draw, int *table_lines) {
+    if (inplace && (*first_draw == false)) {
+        if (*table_lines > 1) {
+            PrintAndLogEx(NORMAL, "\r" _CURSOR_UP_ _CLR_EOS_, *table_lines - 1);
+        } else {
+            PrintAndLogEx(NORMAL, "\r" _CLR_EOS_);
+        }
+    } else if ((inplace == false) && (*first_draw == false)) {
+        PrintAndLogEx(NORMAL, ""); // piped/non-TTY: separate snapshots
+    }
+
+    int present = 0;
+    for (int i = 0; i < n; i++) {
+        if (seen[i].present) present++;
+    }
+    uint64_t now = msclock();
+
+    const char *c_grn = g_session.supports_colors ? ANSI_GREEN : "";
+    const char *c_yel = g_session.supports_colors ? ANSI_YELLOW : "";
+    const char *c_off = g_session.supports_colors ? AEND : "";
+
+    int lines = 0;
+    PrintAndLogEx(INFO, "hf 15 --all   present %d / %d   " _GREEN_("<Enter>") " to exit", present, n);
+    lines++;
+    PrintAndLogEx(INFO, "%3s   %-25s    %-5s    %s", "#", "UID", "DSFID", "status");
+    lines++;
+    PrintAndLogEx(INFO, "%3s   %-25s    %-5s    %s", "---", "-------------------------", "-----", "----------------");
+    lines++;
+    for (int i = 0; i < n; i++) {
+        if (seen[i].present) {
+            PrintAndLogEx(INFO, "%3d   %-25s    %02X       %spresent%s"
+                          , i + 1
+                          , iso15693_sprintUID(NULL, (uint8_t *)seen[i].uid)
+                          , seen[i].dsfid
+                          , c_grn
+                          , c_off
+                         );
+        } else {
+            uint32_t secs = (uint32_t)((now - seen[i].last_seen_ms) / 1000);
+            PrintAndLogEx(INFO, "%3d   %-25s    %02X       %sgone%s (%us ago)"
+                          , i + 1
+                          , iso15693_sprintUID(NULL, (uint8_t *)seen[i].uid)
+                          , seen[i].dsfid
+                          , c_yel
+                          , c_off
+                          , secs
+                         );
+        }
+        lines++;
+    }
+    *table_lines = lines;
+    *first_draw = false;
+}
+
+static int reader_inventory_all(bool fast, bool loop, uint8_t *afi_buf, int afi_len) {
+
+    typedef struct {
+        uint8_t mask[8];
+        uint8_t mask_len; // in bits
+    } inventory_work_item_t;
+
+#define MAX_WORK_ITEMS 256
+#define MAX_FOUND_TAGS 64
+#define MAX_SEEN_TAGS  128
+
+    // Persistent across scans in continuous (-@) mode: every UID seen this session.
+    iso15_seen_tag_t seen[MAX_SEEN_TAGS];
+    int seen_count = 0;
+    bool inplace = loop && g_session.stdoutOnTTY;
+    bool first_draw = true;
+    int table_lines = 0;
+
+    do {
+        inventory_work_item_t work_queue[MAX_WORK_ITEMS];
+        int work_head = 0;
+        int work_tail = 0;
+
+        uint8_t found_uids[MAX_FOUND_TAGS][8];
+        uint8_t found_dsfids[MAX_FOUND_TAGS];
+        int found_count = 0;
+
+        // Start with empty mask
+        memset(&work_queue[0], 0, sizeof(inventory_work_item_t));
+        work_tail = 1;
+
+        while (work_head < work_tail && work_head < MAX_WORK_ITEMS) {
+
+            inventory_work_item_t *item = &work_queue[work_head++];
+
+            // Build inventory command with current mask
+            uint8_t raw_cmd[16] = {0};
+            uint16_t raw_len = 0;
+
+            raw_cmd[raw_len] = ISO15_REQ_SUBCARRIER_SINGLE
+                               | ISO15_REQ_DATARATE_HIGH
+                               | ISO15_REQ_INVENTORY;
+            // 16-slot: do NOT set ISO15_REQINV_SLOT1
+            if (afi_len > 0)
+                raw_cmd[raw_len] |= ISO15_REQINV_AFI;
+            raw_len++;
+
+            raw_cmd[raw_len++] = ISO15693_INVENTORY;
+
+            if (afi_len > 0)
+                raw_cmd[raw_len++] = afi_buf[0];
+
+            raw_cmd[raw_len++] = item->mask_len;
+
+            // Copy mask bytes
+            uint8_t mask_bytes = (item->mask_len + 7) / 8;
+            if (mask_bytes > 0) {
+                memcpy(raw_cmd + raw_len, item->mask, mask_bytes);
+                raw_len += mask_bytes;
+            }
+
+            iso15_inventory_result_t results[ISO15693_MAX_SLOTS] = {{0}};
+            uint8_t num_found = 0;
+
+            // Always keep field on during tree walking; we drop it once after the loop
+            int res = perform_iso15_inventory(raw_cmd, raw_len, true, fast, true, results, &num_found);
+            if (res != PM3_SUCCESS) {
+                PrintAndLogEx(DEBUG, "Inventory round failed (mask_len=%d)", item->mask_len);
+                continue;
+            }
+
+            for (uint8_t s = 0; s < 16; s++) {
+                if (results[s].status == 1 && results[s].data_len >= 12) {
+                    // Valid response: extract UID (in transmission order, LSB first)
+                    uint8_t uid[8];
+                    memcpy(uid, results[s].data + 2, 8);
+
+                    // Check for duplicate
+                    bool duplicate = false;
+                    for (int d = 0; d < found_count; d++) {
+                        if (memcmp(found_uids[d], uid, 8) == 0) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+
+                    if (!duplicate && found_count < MAX_FOUND_TAGS) {
+                        memcpy(found_uids[found_count], uid, 8);
+                        found_dsfids[found_count] = results[s].data[1];
+                        found_count++;
+                    }
+                } else if (results[s].status == 2) {
+                    // Collision in this slot - add to work queue with extended mask
+                    if (item->mask_len + 4 <= 64 && work_tail < MAX_WORK_ITEMS) {
+                        inventory_work_item_t *new_item = &work_queue[work_tail++];
+                        memcpy(new_item->mask, item->mask, sizeof(new_item->mask));
+                        new_item->mask_len = item->mask_len + 4;
+
+                        // The slot number (0-15) represents the 4 bits that
+                        // differentiated this slot. Append slot number to mask.
+                        uint8_t bit_pos = item->mask_len;
+                        uint8_t byte_pos = bit_pos / 8;
+                        uint8_t bit_offset = bit_pos % 8;
+
+                        // Write the 4-bit slot number into the mask at the current position
+                        if (byte_pos < 8) {
+                            new_item->mask[byte_pos] |= (s << bit_offset) & 0xFF;
+                            if (bit_offset > 4 && (byte_pos + 1) < 8) {
+                                new_item->mask[byte_pos + 1] |= (s >> (8 - bit_offset)) & 0xFF;
+                            }
+                        }
+                    }
+                }
+                // status == 0: no response, skip silently
+            }
+
+            if (kbd_enter_pressed()) {
+                PrintAndLogEx(INFO, "Aborted by user");
+                DropField();
+                return PM3_SUCCESS;
+            }
+        }
+
+        // NB: don't DropField() per scan in continuous mode -- it re-inits the field every
+        // round (slow, and spams "Setting ISODEP" when APDU logging is on). The next round
+        // re-selects anyway, and the field is dropped once when the loop exits.
+
+        if (loop) {
+            // Continuous mode: fold this scan into the persistent table and redraw it in place.
+            for (int i = 0; i < seen_count; i++) {
+                seen[i].present = false;
+            }
+            for (int j = 0; j < found_count; j++) {
+                int idx = -1;
+                for (int i = 0; i < seen_count; i++) {
+                    if (memcmp(seen[i].uid, found_uids[j], 8) == 0) {
+                        idx = i;
+                        break;
+                    }
+                }
+                if (idx < 0 && seen_count < MAX_SEEN_TAGS) {
+                    idx = seen_count++;
+                    memcpy(seen[idx].uid, found_uids[j], 8);
+                }
+                if (idx >= 0) {
+                    seen[idx].dsfid = found_dsfids[j];
+                    seen[idx].last_seen_ms = msclock();
+                    seen[idx].present = true;
+                }
+            }
+            iso15_render_presence_table(seen, seen_count, inplace, &first_draw, &table_lines);
+
+        } else {
+            // Single-shot mode: list what was found.
+            if (found_count > 0) {
+                PrintAndLogEx(NORMAL, "");
+                PrintAndLogEx(SUCCESS, "Found " _GREEN_("%d") " tag(s):", found_count);
+                for (int i = 0; i < found_count; i++) {
+                    PrintAndLogEx(SUCCESS, "  %2d: UID " _GREEN_("%s") "  DSFID: %02X",
+                                  i + 1,
+                                  iso15693_sprintUID(NULL, found_uids[i]),
+                                  found_dsfids[i]);
+                }
+                PrintAndLogEx(NORMAL, "");
+            } else {
+                PrintAndLogEx(WARNING, "No tags found");
+            }
+        }
+
+    } while (loop && kbd_enter_pressed() == false);
+
+    DropField();
     return PM3_SUCCESS;
 }
 
 static int CmdHF15Reader(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf 15 reader",
-                  "Act as a ISO-15693 reader.  Look for ISO-15693 tags until Enter or the pm3 button is pressed\n",
+                  "Act as a ISO-15693 reader. Look for ISO-15693 tags until " _GREEN_("<Enter>") " is pressed\n"
+                  "Use --all to perform 16-slot inventory with anti-collision tree walking\n"
+                  "to discover all tags in the field.",
                   "hf 15 reader\n"
-                  "hf 15 reader -@   -> Continuous mode");
+                  "hf 15 reader -@                -> continuous mode\n"
+                  "hf 15 reader --afi 01          -> filter by AFI\n"
+                  "hf 15 reader -2                -> slower '1 out of 256' mode\n"
+                  "hf 15 reader --all             -> find all tags (16-slot anti-collision)\n"
+                  "hf 15 reader --all -@          -> continuously scan for all tags\n"
+                  "hf 15 reader --all --afi 01    -> find all tags with AFI filter\n"
+                  "hf 15 reader --all -2          -> find all tags, slow mode\n");
 
     void *argtable[] = {
         arg_param_begin,
         arg_lit0("@", NULL, "continuous reader mode"),
+        arg_lit0(NULL, "all", "find all tags using 16-slot anti-collision"),
+        arg_str0(NULL, "afi", "<hex>", "Application Family Identifier (1 byte)"),
+        arg_lit0("2", NULL, "use slower '1 out of 256' mode"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
-    bool cm = arg_get_lit(ctx, 1);
+    bool loop = arg_get_lit(ctx, 1);
+    bool all = arg_get_lit(ctx, 2);
+
+    int afi_len = 0;
+    uint8_t afi_buf[1] = {0};
+    CLIGetHexWithReturn(ctx, 3, afi_buf, &afi_len);
+
+    bool fast = (arg_get_lit(ctx, 4) == false); // default is fast
     CLIParserFree(ctx);
 
-    if (cm) {
+    if (loop) {
         PrintAndLogEx(INFO, "Press " _GREEN_("<Enter>") " to exit");
     }
-    readHF15Uid(cm, true);
+
+    if (all) {
+        return reader_inventory_all(fast, loop, afi_buf, afi_len);
+    }
+
+    // Single-tag mode: use --afi/-2 aware path if those flags are set,
+    // otherwise preserve original behavior via readHF15Uid
+    if (afi_len > 0 || !fast) {
+        return reader_single_tag(fast, loop, afi_buf, afi_len);
+    }
+
+    readHF15Uid(loop, true);
     return PM3_SUCCESS;
 }
 
@@ -1179,7 +1636,9 @@ static void hf15EmlClear(void) {
     clearCommandBuffer();
     SendCommandNG(CMD_HF_ISO15693_EML_CLEAR, NULL, 0);
     PacketResponseNG resp;
-    WaitForResponse(CMD_HF_ISO15693_EML_CLEAR, &resp);
+    if (WaitForResponseTimeout(CMD_HF_ISO15693_EML_CLEAR, &resp, 2500) == false) {
+        PrintAndLogEx(WARNING, "timeout while waiting for reply");
+    }
 }
 
 static int hf15EmlSetMem(const uint8_t *data, uint16_t count, size_t offset) {
@@ -1189,12 +1648,16 @@ static int hf15EmlSetMem(const uint8_t *data, uint16_t count, size_t offset) {
         uint8_t data[];
     } PACKED;
 
-    if (count > (PM3_CMD_DATA_SIZE - sizeof(struct p))) {
+    if (count > (g_conn.max_cmd_data_size - sizeof(struct p))) {
         return PM3_ESOFT;
     }
 
     size_t paylen = sizeof(struct p) + count;
     struct p *payload = calloc(1, paylen);
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
 
     payload->offset = offset;
     payload->count = count;
@@ -1238,6 +1701,13 @@ static int CmdHF15ELoad(const char *Cmd) {
         return PM3_EINVARG;
     }
 
+    // a .bin may hold an older struct revision, upgrade it before the checks below
+    res = convert_15_dump_format((uint8_t **)&tag, &bytes_read, true);
+    if (res != PM3_SUCCESS) {
+        free(tag);
+        return res;
+    }
+
     if (bytes_read != sizeof(iso15_tag_t)) {
         PrintAndLogEx(FAILED, "Memory image is not matching tag structure.");
         free(tag);
@@ -1248,8 +1718,11 @@ static int CmdHF15ELoad(const char *Cmd) {
             ((tag->pagesCount * tag->bytesPerPage) > ISO15693_TAG_MAX_SIZE) ||
             (tag->pagesCount == 0) ||
             (tag->bytesPerPage == 0)) {
+
         PrintAndLogEx(FAILED, "Tag size error: pagesCount=%d, bytesPerPage=%d",
-                      tag->pagesCount, tag->bytesPerPage);
+                      tag->pagesCount,
+                      tag->bytesPerPage
+                     );
         free(tag);
         return PM3_EINVARG;
     }
@@ -1289,7 +1762,7 @@ static int CmdHF15ELoad(const char *Cmd) {
     PrintAndLogEx(NORMAL, "");
     PrintAndLogEx(SUCCESS, "uploaded " _YELLOW_("%zu") " bytes to emulator memory", offset);
 
-    PrintAndLogEx(HINT, "You are ready to simulate. See " _YELLOW_("`hf 15 sim -h`"));
+    PrintAndLogEx(HINT, "Hint: You are ready to simulate. See `" _YELLOW_("hf 15 sim -h") "`");
     PrintAndLogEx(INFO, "Done!");
     return PM3_SUCCESS;
 }
@@ -1317,7 +1790,7 @@ static int CmdHF15ESave(const char *Cmd) {
     // reserve memory
     uint8_t *dump = calloc(bytes, sizeof(uint8_t));
     if (dump == NULL) {
-        PrintAndLogEx(WARNING, "Fail, cannot allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -1328,7 +1801,7 @@ static int CmdHF15ESave(const char *Cmd) {
         return PM3_ETIMEOUT;
     }
 
-    pm3_save_dump(filename, dump, bytes, jsf15_v4);
+    pm3_save_dump_json(filename, dump, bytes, jsf15_v5);
 
     free(dump);
     return PM3_SUCCESS;
@@ -1403,7 +1876,7 @@ static void print_tag_15693(iso15_tag_t *tag, bool dense_output, bool verbose) {
         PrintAndLogEx(NORMAL, "");
         PrintAndLogEx(INFO, "--- " _CYAN_("Tag Information") " --%.*s", (tag->bytesPerPage * 3), dashes);
         PrintAndLogEx(SUCCESS, "UID....... " _GREEN_("%s"), iso15693_sprintUID(NULL, tag->uid));
-        PrintAndLogEx(SUCCESS, "TYPE...... " _YELLOW_("%s"), getTagInfo_15(tag->uid));
+        printTagInfo_15(tag->uid);
         PrintAndLogEx(SUCCESS, "DSFID..... 0x%02X", tag->dsfid);
         PrintAndLogEx(SUCCESS, "AFI....... 0x%02X", tag->afi);
         PrintAndLogEx(SUCCESS, "IC ref.... 0x%02X", tag->ic);
@@ -1448,7 +1921,7 @@ static int CmdHF15EView(const char *Cmd) {
     // reserve memory
     uint8_t *dump = calloc(bytes, sizeof(uint8_t));
     if (dump == NULL) {
-        PrintAndLogEx(WARNING, "Fail, cannot allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -1478,12 +1951,13 @@ static int CmdHF15Sim(const char *Cmd) {
         arg_param_begin,
         arg_str0("u", "uid", "<hex>", "UID, 8 hex bytes"),
         arg_int0("b", "blocksize", "<dec>", "block size (def 4)"),
+        arg_int0("t", "timeout", "<dec>", "timeout in ms (def -1, ie. until button press)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, true);
 
     struct {
-        uint8_t uid[HF15_UID_LENGTH];
+        uint8_t uid[ISO15693_UID_LENGTH];
         uint8_t block_size;
     } PACKED payload;
     memset(&payload, 0, sizeof(payload));
@@ -1491,10 +1965,11 @@ static int CmdHF15Sim(const char *Cmd) {
     int uidlen = 0;
     CLIGetHexWithReturn(ctx, 1, payload.uid, &uidlen);
     payload.block_size = arg_get_int_def(ctx, 2, 4);
+    size_t timeout = arg_get_int_def(ctx, 3, -1);
     CLIParserFree(ctx);
 
     // sanity checks
-    if (uidlen != 0 && uidlen != HF15_UID_LENGTH) {
+    if (uidlen != 0 && uidlen != ISO15693_UID_LENGTH) {
         PrintAndLogEx(WARNING, "UID must include 8 hex bytes, got ( " _RED_("%i") " )", uidlen);
         return PM3_EINVARG;
     }
@@ -1530,7 +2005,10 @@ static int CmdHF15Sim(const char *Cmd) {
 
     clearCommandBuffer();
     SendCommandNG(CMD_HF_ISO15693_SIMULATE, (uint8_t *)&payload, sizeof(payload));
-    WaitForResponse(CMD_HF_ISO15693_SIMULATE, &resp);
+    WaitForResponseTimeout(CMD_HF_ISO15693_SIMULATE, &resp, timeout);
+    if (timeout != (size_t) - 1) {
+        SendCommandNG(CMD_BREAK_LOOP, NULL, 0);
+    }
     PrintAndLogEx(INFO, "Done!");
     return PM3_SUCCESS;
 }
@@ -1621,7 +2099,7 @@ static int CmdHF15WriteAfi(const char *Cmd) {
     struct {
         uint8_t pwd[4];
         bool use_pwd;
-        uint8_t uid[HF15_UID_LENGTH];
+        uint8_t uid[ISO15693_UID_LENGTH];
         bool use_uid;
         uint8_t afi;
     } PACKED payload;
@@ -1642,7 +2120,7 @@ static int CmdHF15WriteAfi(const char *Cmd) {
     }
 
     payload.use_uid = false;
-    if (uidlen == HF15_UID_LENGTH) {
+    if (uidlen == ISO15693_UID_LENGTH) {
         payload.use_uid = true;
     }
 
@@ -1700,7 +2178,7 @@ static int CmdHF15WriteDsfid(const char *Cmd) {
 
     CLIExecWithReturn(ctx, Cmd, argtable, false);
 
-    uint8_t uid[HF15_UID_LENGTH] = {0};
+    uint8_t uid[ISO15693_UID_LENGTH] = {0};
     int uidlen = 0;
     CLIGetHexWithReturn(ctx, 1, uid, &uidlen);
 
@@ -1720,10 +2198,10 @@ static int CmdHF15WriteDsfid(const char *Cmd) {
     }
 
     // request to be sent to device/card
-    uint8_t approxlen = 2 + 8 + 1 + 2;
+    uint16_t approxlen = 2 + ISO15693_UID_LENGTH + 1 + 2;
     iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + approxlen);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -1739,10 +2217,10 @@ static int CmdHF15WriteDsfid(const char *Cmd) {
                 free(packet);
                 return PM3_EINVARG;
             }
-            uidlen = HF15_UID_LENGTH;
+            uidlen = ISO15693_UID_LENGTH;
         }
 
-        if (uidlen == HF15_UID_LENGTH) {
+        if (uidlen == ISO15693_UID_LENGTH) {
             // add UID (scan, uid)
             memcpy(packet->raw + packet->rawlen, uid, uidlen);
             packet->rawlen += uidlen;
@@ -1787,10 +2265,12 @@ static int CmdHF15WriteDsfid(const char *Cmd) {
 static int CmdHF15Dump(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf 15 dump",
-                  "This command dumps the contents of a ISO-15693 tag and save to file (bin/json)",
+                  "This command dumps the contents of a ISO-15693 tag and saves it to a JSON file.\n"
+                  "Writing .bin is no longer supported, the raw struct carries no layout\n"
+                  "information. Reading .bin/.eml/.json all still work.",
                   "hf 15 dump\n"
                   "hf 15 dump -*\n"
-                  "hf 15 dump -u E011223344556677 -f hf-15-my-dump.bin"
+                  "hf 15 dump -u E011223344556677 -f hf-15-my-dump"
                  );
 
     void *argtable[6 + 6] = {0};
@@ -1804,7 +2284,7 @@ static int CmdHF15Dump(const char *Cmd) {
 
     CLIExecWithReturn(ctx, Cmd, argtable, true);
 
-    uint8_t uid[HF15_UID_LENGTH] = {0};
+    uint8_t uid[ISO15693_UID_LENGTH] = {0};
     int uidlen = 0;
     CLIGetHexWithReturn(ctx, 1, uid, &uidlen);
 
@@ -1835,22 +2315,22 @@ static int CmdHF15Dump(const char *Cmd) {
     }
 
     // default fallback to scan for tag.
-    if (uidlen != HF15_UID_LENGTH && !unaddressed) {
+    if (uidlen != ISO15693_UID_LENGTH && !unaddressed) {
         scan = true;
     }
 
     // request to be sent to device/card
-    uint8_t approxlen = 2 + 8 + 1 + 2;
+    uint16_t approxlen = 2 + ISO15693_UID_LENGTH + 1 + 2;
     iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + approxlen);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
     // struct of ISO15693 tag memory (new file format)
     iso15_tag_t *tag = (iso15_tag_t *)calloc(1, sizeof(iso15_tag_t));
     if (tag == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         free(packet);
         return PM3_EMALLOC;
     };
@@ -1871,11 +2351,11 @@ static int CmdHF15Dump(const char *Cmd) {
                 return PM3_EINVARG;
             }
         } else {
-            reverse_array(uid, HF15_UID_LENGTH);
+            reverse_array(uid, ISO15693_UID_LENGTH);
         }
         // add UID (scan, uid)
-        memcpy(packet->raw + packet->rawlen, uid, HF15_UID_LENGTH);
-        packet->rawlen += HF15_UID_LENGTH;
+        memcpy(packet->raw + packet->rawlen, uid, ISO15693_UID_LENGTH);
+        packet->rawlen += ISO15693_UID_LENGTH;
         used_uid = true;
     } else {
         PrintAndLogEx(INFO, "Using unaddressed mode");
@@ -1912,36 +2392,50 @@ static int CmdHF15Dump(const char *Cmd) {
     uint8_t dCpt = 10;
 
     int res = iso15_error_handling_card_response(d, resp.length);
-    if (res != PM3_SUCCESS) {
+    if (res == PM3_ECRC) {
         free(tag);
         free(packet);
         return res;
     }
 
-    memcpy(tag->uid, &d[2], 8);
+    if (res == PM3_SUCCESS) {
+        memcpy(tag->uid, d + 2, 8);
 
-    if (d[1] & 0x01) {
-        tag->dsfid = d[dCpt++];
-    }
+        if (d[1] & 0x01) {
+            tag->dsfid = d[dCpt];
+        }
+        dCpt++;
 
-    if (d[1] & 0x02) {
-        tag->afi = d[dCpt++];
-    }
+        if (d[1] & 0x02) {
+            tag->afi = d[dCpt];
+        }
+        dCpt++;
 
-    if (d[1] & 0x04) {
-        tag->pagesCount = d[dCpt++] + 1;
-        tag->bytesPerPage = d[dCpt++] + 1;
+        if (d[1] & 0x04) {
+            tag->pagesCount = d[dCpt] + 1;
+            tag->bytesPerPage = d[dCpt + 1] + 1;
+        } else {
+            // Set tag memory layout values (if can't be read in SYSINFO)
+            tag->bytesPerPage = blocksize;
+            tag->pagesCount = 128;
+        }
+        dCpt += 2;
+
+        if (d[1] & 0x08) {
+            tag->ic = d[dCpt];
+        }
+        dCpt++;
+
     } else {
-        // Set tag memory layout values (if can't be readed in SYSINFO)
+        tag->uid[0] = 0xE0;
+        tag->dsfid = 0;
+        tag->afi = 0;
+        // Set tag memory layout values (if can't be read in SYSINFO)
         tag->bytesPerPage = blocksize;
         tag->pagesCount = 128;
     }
 
-    if (d[1] & 0x08) {
-        tag->ic = d[dCpt++];
-    }
-
-    // add lenght for blockno (1)
+    // add length for blockno (1)
     packet->rawlen++;
     packet->raw[0] |= ISO15_REQ_OPTION; // Add option to dump lock status
     packet->raw[1] = ISO15693_READBLOCK;
@@ -2035,7 +2529,7 @@ static int CmdHF15Dump(const char *Cmd) {
         FillFileNameByUID(fptr, SwapEndian64(uid, sizeof(uid), 8), "-dump", sizeof(uid));
     }
 
-    pm3_save_dump(filename, (uint8_t *)tag, sizeof(iso15_tag_t), jsf15_v4);
+    pm3_save_dump_json(filename, (uint8_t *)tag, sizeof(iso15_tag_t), jsf15_v5);
 
     free(tag);
     return PM3_SUCCESS;
@@ -2080,11 +2574,11 @@ static int CmdHF15Raw(const char *Cmd) {
     bool wait = arg_get_lit(ctx, 7);
     CLIParserFree(ctx);
 
-    datalen = (datalen > PM3_CMD_DATA_SIZE) ? PM3_CMD_DATA_SIZE : datalen;
+    datalen = (datalen >= g_conn.max_cmd_data_size) ? g_conn.max_cmd_data_size : datalen;
 
     if (crc) {
 
-        if ((datalen - 2) < PM3_CMD_DATA_SIZE) {
+        if ((datalen - 2) < g_conn.max_cmd_data_size) {
             AddCrc15(data, datalen);
             datalen += 2;
         } else {
@@ -2095,7 +2589,7 @@ static int CmdHF15Raw(const char *Cmd) {
 
     iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + datalen);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -2128,15 +2622,49 @@ static int CmdHF15Raw(const char *Cmd) {
     SendCommandNG(CMD_HF_ISO15693_COMMAND, (uint8_t *)packet, ISO15_RAW_LEN(datalen));
     free(packet);
 
+    // Check if this was a 16-slot inventory request
+    bool is_inventory = (datalen > 0) && ((data[0] & ISO15_REQ_INVENTORY) != 0);
+    bool is_16slot = is_inventory && ((data[0] & ISO15_REQINV_SLOT1) == 0);
+
     if (read_respone) {
         PacketResponseNG resp;
-        if (WaitForResponseTimeout(CMD_HF_ISO15693_COMMAND, &resp, 2000)) {
+        if (WaitForResponseTimeout(CMD_HF_ISO15693_COMMAND, &resp, is_16slot ? 4000 : 2000)) {
             if (resp.status == PM3_ETEAROFF) {
                 PrintAndLogEx(INFO, "Tear off triggered");
                 return resp.status;
             }
 
-            if (resp.length < 2) {
+            if (is_16slot && resp.length >= 1 + (16 * sizeof(iso15_slot_result_t))) {
+                // Parse 16-slot inventory response
+                iso15_inventory_response_t *inv = (iso15_inventory_response_t *)resp.data.asBytes;
+                uint16_t offset = 0;
+                int found = 0;
+
+                for (uint8_t s = 0; s < inv->slot_count && s < 16; s++) {
+                    if (inv->slots[s].status == 1 && inv->slots[s].len > 0) {
+                        uint8_t *slot_data = inv->data + offset;
+
+                        if (inv->slots[s].len >= 3 && CheckCrc15(slot_data, inv->slots[s].len)) {
+                            // CRC valid - show raw hex (format varies by command)
+                            PrintAndLogEx(SUCCESS, "Slot %2d: (%u) %s", s, inv->slots[s].len,
+                                          sprint_hex(slot_data, inv->slots[s].len));
+                            found++;
+                        } else {
+                            PrintAndLogEx(INFO, "Slot %2d: " _YELLOW_("collision / CRC fail") " (%u) %s", s,
+                                          inv->slots[s].len,
+                                          sprint_hex(slot_data, inv->slots[s].len));
+                        }
+                    }
+                    if (inv->slots[s].len > 0)
+                        offset += inv->slots[s].len;
+                }
+
+                if (found == 0) {
+                    PrintAndLogEx(WARNING, "No valid responses in any slot");
+                } else {
+                    PrintAndLogEx(SUCCESS, "Found %d tag(s) in 16-slot inventory", found);
+                }
+            } else if (resp.length < 2) {
                 PrintAndLogEx(WARNING, "command failed");
             } else {
                 PrintAndLogEx(SUCCESS, "(%u) %s", resp.length, sprint_hex(resp.data.asBytes, resp.length));
@@ -2175,10 +2703,10 @@ static int CmdHF15Readmulti(const char *Cmd) {
 
     CLIExecWithReturn(ctx, Cmd, argtable, false);
 
-    uint8_t uid[HF15_UID_LENGTH] = {0x00};
+    uint8_t uid[ISO15693_UID_LENGTH] = {0x00};
     int uidlen = 0;
     CLIGetHexWithReturn(ctx, 1, uid, &uidlen);
-    bool uid_set = (uidlen == HF15_UID_LENGTH) ? true : false;
+    bool uid_set = (uidlen == ISO15693_UID_LENGTH) ? true : false;
 
     bool unaddressed = arg_get_lit(ctx, 2);
     bool scan = (arg_get_lit(ctx, 3) || (!uid_set && !unaddressed)) ? true : false; //Default fallback to scan for tag. Overriding unaddressed parameter.
@@ -2219,7 +2747,7 @@ static int CmdHF15Readmulti(const char *Cmd) {
     uint8_t approxlen = 2 + 8 + 2 + 2;
     iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + approxlen);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -2236,11 +2764,11 @@ static int CmdHF15Readmulti(const char *Cmd) {
                 return PM3_EINVARG;
             }
         } else {
-            reverse_array(uid, HF15_UID_LENGTH);
+            reverse_array(uid, ISO15693_UID_LENGTH);
         }
         // add UID (scan, uid)
-        memcpy(packet->raw + packet->rawlen, uid, HF15_UID_LENGTH);
-        packet->rawlen += HF15_UID_LENGTH;
+        memcpy(packet->raw + packet->rawlen, uid, ISO15693_UID_LENGTH);
+        packet->rawlen += ISO15693_UID_LENGTH;
 
     } else {
         PrintAndLogEx(INFO, "Using unaddressed mode");
@@ -2252,7 +2780,9 @@ static int CmdHF15Readmulti(const char *Cmd) {
 
     // 0 means 1 page,
     // 1 means 2 pages, ...
-    if (blockcnt > 0) blockcnt--;
+    if (blockcnt > 0) {
+        blockcnt--;
+    }
 
     packet->raw[packet->rawlen++] = blockno;
     packet->raw[packet->rawlen++] = blockcnt;
@@ -2282,7 +2812,7 @@ static int CmdHF15Readmulti(const char *Cmd) {
     ISO15_ERROR_HANDLING_CARD_RESPONSE(d, resp.length)
 
     // 1 byte cmd,  1 lock byte,  4 / 8 bytes block size,  2 crc
-    if (resp.length > (1 + (blockcnt * (blocksize + 1)) + 2)) {
+    if (resp.length > (1 + ((blockcnt + 1) * (blocksize + 1)) + 2)) {
         PrintAndLogEx(WARNING, "got longer response. Check block size!");
     }
 
@@ -2333,10 +2863,10 @@ static int CmdHF15Readblock(const char *Cmd) {
 
     CLIExecWithReturn(ctx, Cmd, argtable, false);
 
-    uint8_t uid[HF15_UID_LENGTH];
+    uint8_t uid[ISO15693_UID_LENGTH];
     int uidlen = 0;
     CLIGetHexWithReturn(ctx, 1, uid, &uidlen);
-    bool uid_set = (uidlen == HF15_UID_LENGTH) ? true : false;
+    bool uid_set = (uidlen == ISO15693_UID_LENGTH) ? true : false;
 
     bool unaddressed = arg_get_lit(ctx, 2);
     bool scan = (arg_get_lit(ctx, 3) || (!uid_set && !unaddressed)) ? true : false; // Default fallback to scan for tag. Overriding unaddressed parameter.
@@ -2369,10 +2899,10 @@ static int CmdHF15Readblock(const char *Cmd) {
     }
 
     // request to be sent to device/card
-    uint8_t approxlen = 2 + 8 + 1 + 2;
+    uint16_t approxlen = 2 + ISO15693_UID_LENGTH + 1 + 2;
     iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + approxlen);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -2390,11 +2920,11 @@ static int CmdHF15Readblock(const char *Cmd) {
                 return PM3_EINVARG;
             }
         } else {
-            reverse_array(uid, HF15_UID_LENGTH);
+            reverse_array(uid, ISO15693_UID_LENGTH);
         }
         // add UID (scan, uid)
-        memcpy(packet->raw + packet->rawlen, uid, HF15_UID_LENGTH);
-        packet->rawlen += HF15_UID_LENGTH;
+        memcpy(packet->raw + packet->rawlen, uid, ISO15693_UID_LENGTH);
+        packet->rawlen += ISO15693_UID_LENGTH;
 
     } else {
         PrintAndLogEx(INFO, "Using unaddressed mode");
@@ -2477,7 +3007,7 @@ static int hf_15_write_blk(const uint8_t *pm3flags, uint16_t flags, const uint8_
     uint8_t approxlen = 21;
     iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + approxlen);
     if (packet == NULL) {
-        PrintAndLogEx(FAILED, "failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -2487,8 +3017,8 @@ static int hf_15_write_blk(const uint8_t *pm3flags, uint16_t flags, const uint8_
 
     // add UID
     if (uid) {
-        memcpy(packet->raw +  packet->rawlen, uid, HF15_UID_LENGTH);
-        packet->rawlen += HF15_UID_LENGTH;
+        memcpy(packet->raw +  packet->rawlen, uid, ISO15693_UID_LENGTH);
+        packet->rawlen += ISO15693_UID_LENGTH;
     }
 
     packet->raw[packet->rawlen++] = blockno;
@@ -2547,10 +3077,10 @@ static int CmdHF15Write(const char *Cmd) {
     argtable[arglen++] = arg_param_end;
     CLIExecWithReturn(ctx, Cmd, argtable, false);
 
-    uint8_t uid[HF15_UID_LENGTH];
+    uint8_t uid[ISO15693_UID_LENGTH];
     int uidlen = 0;
     CLIGetHexWithReturn(ctx, 1, uid, &uidlen);
-    bool uid_set = (uidlen == HF15_UID_LENGTH) ? true : false;
+    bool uid_set = (uidlen == ISO15693_UID_LENGTH) ? true : false;
 
     bool unaddressed = arg_get_lit(ctx, 2);
     bool scan = (arg_get_lit(ctx, 3) || (!uid_set && !unaddressed)) ? true : false; // Default fallback to scan for tag. Overriding unaddressed parameter.
@@ -2586,7 +3116,7 @@ static int CmdHF15Write(const char *Cmd) {
                 return PM3_EINVARG;
             }
         } else {
-            reverse_array(uid, HF15_UID_LENGTH);
+            reverse_array(uid, ISO15693_UID_LENGTH);
         }
     } else {
         PrintAndLogEx(INFO, "Using unaddressed mode");
@@ -2621,7 +3151,7 @@ static int CmdHF15Restore(const char *Cmd) {
                   "hf 15 restore -u E011223344556677 -f hf-15-my-dump.bin"
                  );
 
-    void *argtable[6 + 5] = {0};
+    void *argtable[6 + 4] = {0};
     uint8_t arglen = arg_add_default(argtable);
     argtable[arglen++] = arg_str0("f", "file", "<fn>", "Specify a filename for dump file");
     argtable[arglen++] = arg_int0("r", "retry", "<dec>", "number of retries (def 3)");
@@ -2629,7 +3159,7 @@ static int CmdHF15Restore(const char *Cmd) {
     argtable[arglen++] = arg_param_end;
     CLIExecWithReturn(ctx, Cmd, argtable, true);
 
-    uint8_t uid[HF15_UID_LENGTH];
+    uint8_t uid[ISO15693_UID_LENGTH];
     int uidlen = 0;
     CLIGetHexWithReturn(ctx, 1, uid, &uidlen);
 
@@ -2659,7 +3189,7 @@ static int CmdHF15Restore(const char *Cmd) {
 
     // default fallback to scan for tag.
     // overriding unaddress parameter :)
-    if (uidlen != HF15_UID_LENGTH) {
+    if (uidlen != ISO15693_UID_LENGTH) {
         scan = true;
     }
 
@@ -2671,7 +3201,7 @@ static int CmdHF15Restore(const char *Cmd) {
                 return PM3_EINVARG;
             }
         } else {
-            reverse_array(uid, HF15_UID_LENGTH);
+            reverse_array(uid, ISO15693_UID_LENGTH);
         }
     } else {
         PrintAndLogEx(INFO, "Using unaddressed mode");
@@ -2700,6 +3230,13 @@ static int CmdHF15Restore(const char *Cmd) {
         return PM3_EINVARG;
     }
 
+    // a .bin may hold an older struct revision, upgrade it before the checks below
+    res = convert_15_dump_format((uint8_t **)&tag, &bytes_read, verbose);
+    if (res != PM3_SUCCESS) {
+        free(tag);
+        return res;
+    }
+
     if (bytes_read != sizeof(iso15_tag_t)) {
         PrintAndLogEx(FAILED, "Memory image is not matching tag structure.");
         free(tag);
@@ -2710,8 +3247,11 @@ static int CmdHF15Restore(const char *Cmd) {
             ((tag->pagesCount * tag->bytesPerPage) > ISO15693_TAG_MAX_SIZE) ||
             (tag->pagesCount == 0) ||
             (tag->bytesPerPage == 0)) {
+
         PrintAndLogEx(FAILED, "Tag size error: pagesCount=%d, bytesPerPage=%d",
-                      tag->pagesCount, tag->bytesPerPage);
+                      tag->pagesCount,
+                      tag->bytesPerPage
+                     );
         free(tag);
         return PM3_EINVARG;
     }
@@ -2729,6 +3269,11 @@ static int CmdHF15Restore(const char *Cmd) {
     size_t bytes = 0;
     uint16_t i = 0;
     uint8_t *data = calloc(tag->bytesPerPage, sizeof(uint8_t));
+    if (data == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        free(tag);
+        return PM3_EMALLOC;
+    }
     uint32_t tried;
     while (bytes < (tag->pagesCount * tag->bytesPerPage)) {
 
@@ -2737,8 +3282,8 @@ static int CmdHF15Restore(const char *Cmd) {
 
         for (tried = 0; tried < retries; tried++) {
 
-            retval = hf_15_write_blk(&pm3flags, flags, uid, fast
-                                     , i, data, tag->bytesPerPage);
+            retval = hf_15_write_blk(&pm3flags, flags, uid, fast, i, data, tag->bytesPerPage);
+
             if (retval == PM3_SUCCESS) {
                 PrintAndLogEx(INPLACE, "blk %3d", i);
 
@@ -2774,9 +3319,82 @@ static int CmdHF15Restore(const char *Cmd) {
     DropField();
 
     PrintAndLogEx(NORMAL, "");
-    PrintAndLogEx(HINT, "try `" _YELLOW_("hf 15 dump --ns") "` to verify");
+    PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("hf 15 dump --ns") "` to verify");
     PrintAndLogEx(INFO, "Done!");
     return PM3_SUCCESS;
+}
+
+// ISO15693 magic "V3" tag support
+#define ISO15_MAGIC_V3_BLK_UID_LO   0x10
+#define ISO15_MAGIC_V3_BLK_UID_HI   0x11
+#define ISO15_MAGIC_V3_BLK_SIG_A    0x14
+#define ISO15_MAGIC_V3_BLK_SIG_B    0x15
+
+// signature check in block 0x14/0x15
+static const uint8_t iso15_magic_v3_sig_a[4] = {0xA5, 0x2B, 0x44, 0x2C};
+static const uint8_t iso15_magic_v3_sig_b[4] = {0x21, 0xAE, 0x93, 0x00};
+
+// finalize command write in block 0x14/0x15
+// hf 15 raw -wac -d 022114A52B442C
+// hf 15 raw -wac -d 02211569E25D00
+static const uint8_t iso15_magic_v3_fin_a[4] = {0xA5, 0x2B, 0x44, 0x2C};
+static const uint8_t iso15_magic_v3_fin_b[4] = {0x69, 0xE2, 0x5D, 0x00};
+
+// Read one 4-byte block from a magic V3 tag in unaddressed mode.
+static int hf15_magic_v3_read_blk(uint8_t blockno, uint8_t out[4]) {
+
+    uint16_t approxlen = 2 + 1 + 2;
+    iso15_raw_cmd_t *packet = (iso15_raw_cmd_t *)calloc(1, sizeof(iso15_raw_cmd_t) + approxlen);
+    if (packet == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
+
+    // enforce OPTION flag so we get the lock byte, keeping data at offset 2
+    packet->raw[packet->rawlen++] = arg_get_raw_flag(0, true, false, true);
+    packet->raw[packet->rawlen++] = ISO15693_READBLOCK;
+    packet->raw[packet->rawlen++] = blockno;
+    AddCrc15(packet->raw, packet->rawlen);
+    packet->rawlen += 2;
+    packet->flags = (ISO15_CONNECT | ISO15_READ_RESPONSE);
+
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_ISO15693_COMMAND, (uint8_t *)packet, ISO15_RAW_LEN(packet->rawlen));
+    free(packet);
+
+    PacketResponseNG resp;
+    if (WaitForResponseTimeout(CMD_HF_ISO15693_COMMAND, &resp, 2000) == false) {
+        PrintAndLogEx(DEBUG, "iso15693 timeout");
+        return PM3_ETIMEOUT;
+    }
+
+    ISO15_ERROR_HANDLING_RESPONSE
+
+    uint8_t *d = resp.data.asBytes;
+
+    ISO15_ERROR_HANDLING_CARD_RESPONSE(d, resp.length)
+
+    memcpy(out, d + 2, 4);
+    return PM3_SUCCESS;
+}
+
+// Write one 4-byte block to a magic V3 tag in unaddressed mode.
+static int hf15_magic_v3_write_blk(uint8_t blockno, const uint8_t *data) {
+    uint16_t flags = arg_get_raw_flag(0, true, false, false);
+    return hf_15_write_blk(NULL, flags, NULL, true, blockno, data, 4);
+}
+
+// Detect an un-finalized magic V3 tag by its configuration-mode signature.
+static bool hf15_magic_v3_is_config_mode(void) {
+    uint8_t a[4] = {0};
+    uint8_t b[4] = {0};
+    if (hf15_magic_v3_read_blk(ISO15_MAGIC_V3_BLK_SIG_A, a) != PM3_SUCCESS) {
+        return false;
+    }
+    if (hf15_magic_v3_read_blk(ISO15_MAGIC_V3_BLK_SIG_B, b) != PM3_SUCCESS) {
+        return false;
+    }
+    return (memcmp(a, iso15_magic_v3_sig_a, 4) == 0) && (memcmp(b, iso15_magic_v3_sig_b, 4) == 0);
 }
 
 /**
@@ -2787,29 +3405,39 @@ static int CmdHF15CSetUID(const char *Cmd) {
 
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf 15 csetuid",
-                  "Set UID for magic Chinese card (only works with such cards)\n",
+                  "Set UID for magic Chinese card (only works with such cards)\n"
+                  "For magic 'V3' tags this writes the UID configuration only and is repeatable;\n"
+                  "run `" _YELLOW_("hf 15 cfinalize") "` afterwards to lock the UID permanently.",
                   "hf 15 csetuid -u E011223344556677       -> use gen1 command\n"
-                  "hf 15 csetuid -u E011223344556677 --v2  -> use gen2 command"
+                  "hf 15 csetuid -u E011223344556677 --v2  -> use gen2 command\n"
+                  "hf 15 csetuid -u E011223344556677 --v3  -> use gen3 (V3) magic tag"
                  );
 
     void *argtable[] = {
         arg_param_begin,
         arg_str1("u", "uid", "<hex>", "UID, 8 hex bytes"),
         arg_lit0("2", "v2", "Use gen2 magic command"),
+        arg_lit0("3", "v3", "Use gen3 (V3) magic tag (repeatable, needs cfinalize)"),
         arg_param_end
     };
     CLIExecWithReturn(ctx, Cmd, argtable, false);
 
     struct {
-        uint8_t uid[HF15_UID_LENGTH];
+        uint8_t uid[ISO15693_UID_LENGTH];
     } PACKED payload;
 
     int uidlen = 0;
     CLIGetHexWithReturn(ctx, 1, payload.uid, &uidlen);
     bool use_v2 = arg_get_lit(ctx, 2);
+    bool use_v3 = arg_get_lit(ctx, 3);
     CLIParserFree(ctx);
 
-    if (uidlen != HF15_UID_LENGTH) {
+    if (use_v2 && use_v3) {
+        PrintAndLogEx(WARNING, "Select only one of " _YELLOW_("--v2") " / " _YELLOW_("--v3"));
+        return PM3_EINVARG;
+    }
+
+    if (uidlen != ISO15693_UID_LENGTH) {
         PrintAndLogEx(WARNING, "UID must include 8 hex bytes, got " _RED_("%i"), uidlen);
         return PM3_EINVARG;
     }
@@ -2823,26 +3451,47 @@ static int CmdHF15CSetUID(const char *Cmd) {
 
     PrintAndLogEx(INFO, "Get current tag");
 
-    uint8_t carduid[HF15_UID_LENGTH] = {0x00};
+    uint8_t carduid[ISO15693_UID_LENGTH] = {0x00};
     if (getUID(true, false, carduid) != PM3_SUCCESS) {
         PrintAndLogEx(FAILED, "no tag found");
         return PM3_ESOFT;
     }
 
     PrintAndLogEx(INFO, "Writing...");
-    PacketResponseNG resp;
-    clearCommandBuffer();
 
-    uint16_t cmd = CMD_HF_ISO15693_CSETUID;
-    if (use_v2) {
-        cmd = CMD_HF_ISO15693_CSETUID_V2;
-    }
+    if (use_v3) {
+        /*
+        for example id: E011223344556677
+        [=]   16 | 77 66 55 44 | 0 | wfUD
+        [=]   17 | 33 22 11 E0 | 0 | 3"..
+        */
+        uint8_t blk_lo[4] = {0};
+        uint8_t blk_hi[4] = {0};
+        reverse_array_copy(payload.uid + 4, 4, blk_lo);
+        reverse_array_copy(payload.uid, 4, blk_hi);
 
-    SendCommandNG(cmd, (uint8_t *)&payload, sizeof(payload));
-    if (WaitForResponseTimeout(cmd, &resp, 2000) == false) {
-        PrintAndLogEx(WARNING, "timeout while waiting for reply");
-        DropField();
-        return PM3_ESOFT;
+        if (hf15_magic_v3_write_blk(ISO15_MAGIC_V3_BLK_UID_LO, blk_lo) != PM3_SUCCESS ||
+                hf15_magic_v3_write_blk(ISO15_MAGIC_V3_BLK_UID_HI, blk_hi) != PM3_SUCCESS) {
+            PrintAndLogEx(FAILED, "Setting new UID ( " _RED_("fail") " )");
+            PrintAndLogEx(NORMAL, "");
+            return PM3_ESOFT;
+        }
+
+    } else {
+        PacketResponseNG resp;
+        clearCommandBuffer();
+
+        uint16_t cmd = CMD_HF_ISO15693_CSETUID;
+        if (use_v2) {
+            cmd = CMD_HF_ISO15693_CSETUID_V2;
+        }
+
+        SendCommandNG(cmd, (uint8_t *)&payload, sizeof(payload));
+        if (WaitForResponseTimeout(cmd, &resp, 2000) == false) {
+            PrintAndLogEx(WARNING, "timeout while waiting for reply");
+            DropField();
+            return PM3_ESOFT;
+        }
     }
 
     PrintAndLogEx(INFO, "Verifying...");
@@ -2853,10 +3502,10 @@ static int CmdHF15CSetUID(const char *Cmd) {
     }
 
     // reverse cardUID to compare
-    uint8_t revuid[HF15_UID_LENGTH] = {0};
+    uint8_t revuid[ISO15693_UID_LENGTH] = {0};
     reverse_array_copy(carduid, sizeof(carduid), revuid);
 
-    if (memcmp(revuid, payload.uid, HF15_UID_LENGTH) == 0) {
+    if (memcmp(revuid, payload.uid, ISO15693_UID_LENGTH) == 0) {
         PrintAndLogEx(SUCCESS, "Setting new UID ( " _GREEN_("ok") " )");
         PrintAndLogEx(NORMAL, "");
         return PM3_SUCCESS;;
@@ -2865,6 +3514,69 @@ static int CmdHF15CSetUID(const char *Cmd) {
     PrintAndLogEx(FAILED, "Setting new UID ( " _RED_("fail") " )");
     PrintAndLogEx(NORMAL, "");
     return PM3_ESOFT;
+}
+
+/**
+ * Commandline handling: HF15 CMD CFINALIZE
+ * Finalize a magic 'V3' tag - irreversible
+ */
+static int CmdHF15CFinalize(const char *Cmd) {
+
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf 15 cfinalize",
+                  "Finalize a magic ISO15693 'V3' tag.\n"
+                  _RED_("This operation is irreversible.") " After finalize the configuration\n"
+                  "area is erased and the UID can no longer be changed. Set the UID with\n"
+                  "`" _YELLOW_("hf 15 csetuid --v3") "` first, then lock it in with this command.",
+                  "hf 15 cfinalize -y"
+                 );
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("y", "yes", "Confirm the irreversible finalize operation"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, true);
+    bool confirmed = arg_get_lit(ctx, 1);
+    CLIParserFree(ctx);
+
+    PrintAndLogEx(INFO, "Get current tag");
+
+    uint8_t carduid[ISO15693_UID_LENGTH] = {0x00};
+    if (getUID(true, false, carduid) != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "no tag found");
+        return PM3_ESOFT;
+    }
+
+    // Safety: only proceed on a tag that is actually an un-finalized magic V3.
+    // Writing the finalize values to any other tag may permanently brick it.
+    if (hf15_magic_v3_is_config_mode() == false) {
+        PrintAndLogEx(FAILED, "tag is not an un-finalized magic " _YELLOW_("V3") " tag");
+        PrintAndLogEx(HINT, "Hint: signature in blocks 0x14/0x15 not found - already finalized or not a V3 tag");
+        return PM3_ESOFT;
+    }
+
+    PrintAndLogEx(SUCCESS, "Magic " _GREEN_("V3") " tag in configuration mode ( " _GREEN_("ok") " )");
+
+    if (confirmed == false) {
+        PrintAndLogEx(WARNING, _RED_("This operation is irreversible!") " The UID will be locked permanently.");
+        PrintAndLogEx(WARNING, "Add " _YELLOW_("-y") " to confirm and proceed.");
+        return PM3_EINVARG;
+    }
+
+    PrintAndLogEx(INFO, "Finalizing...");
+
+    if (hf15_magic_v3_write_blk(ISO15_MAGIC_V3_BLK_SIG_A, iso15_magic_v3_fin_a) != PM3_SUCCESS ||
+            hf15_magic_v3_write_blk(ISO15_MAGIC_V3_BLK_SIG_B, iso15_magic_v3_fin_b) != PM3_SUCCESS) {
+        PrintAndLogEx(FAILED, "Finalize ( " _RED_("fail") " )");
+        PrintAndLogEx(NORMAL, "");
+        return PM3_ESOFT;
+    }
+
+    PrintAndLogEx(SUCCESS, "Finalize ( " _GREEN_("ok") " )");
+    PrintAndLogEx(HINT, "Hint: UID is now locked; the tag behaves like a normal ISO15693 tag");
+    PrintAndLogEx(NORMAL, "");
+    return PM3_SUCCESS;
 }
 
 static int CmdHF15SlixEASEnable(const char *Cmd) {
@@ -3172,8 +3884,7 @@ static int CmdHF15SlixWritePassword(const char *Cmd) {
         }
     }
 
-    PrintAndLogEx(INFO, "Trying to write " _YELLOW_("%s") " as " _YELLOW_("%s") " password"
-                  , sprint_hex_inrow(payload.new_pwd, sizeof(payload.new_pwd)), value);
+    PrintAndLogEx(INFO, "Trying to write " _YELLOW_("%s") " as " _YELLOW_("%s") " password", sprint_hex_inrow(payload.new_pwd, sizeof(payload.new_pwd)), value);
 
     PacketResponseNG resp;
     clearCommandBuffer();
@@ -3195,6 +3906,100 @@ static int CmdHF15SlixWritePassword(const char *Cmd) {
         }
         case PM3_SUCCESS: {
             PrintAndLogEx(SUCCESS, "Password written ( " _GREEN_("ok") " ) ");
+            break;
+        }
+    }
+    return resp.status;
+}
+
+static int CmdHF15SlixProtectPage(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf 15 slixprotectpage",
+                  "Defines protection pointer address of user mem and access cond. for pages",
+                  "hf 15 slixprotectpage -w deadbeef -p 3 -h 3");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_str0("r", "readpw", "<hex>", "read password, 4 hex bytes"),
+        arg_str0("w", "writepw", "<hex>", "write password, 4 hex bytes"),
+        arg_int0("p", "ptr", "<dec>", "protection pointer page (0-78), if 0 entire user mem"),
+        arg_int1("l", "lo", "<dec>", "page protection flags of lo page (0-None, 1-ReadPR, 2-WritePR)"),
+        arg_int1("i", "hi", "<dec>", "page protection flags of hi page (0-None, 1-ReadPR, 2-WritePR)"),
+        arg_param_end
+    };
+
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    struct p {
+        uint8_t read_pwd[4];
+        uint8_t write_pwd[4];
+        uint8_t divide_ptr;
+        uint8_t prot_status;
+    } PACKED payload = {0};
+    int pwdlen = 0;
+
+    CLIGetHexWithReturn(ctx, 1, payload.read_pwd, &pwdlen);
+
+    if (pwdlen > 0 && pwdlen != 4) {
+        PrintAndLogEx(WARNING, "read password must be 4 hex bytes if provided");
+        CLIParserFree(ctx);
+        return PM3_ESOFT;
+    }
+
+    CLIGetHexWithReturn(ctx, 2, payload.write_pwd, &pwdlen);
+
+    if (pwdlen > 0 && pwdlen != 4) {
+        PrintAndLogEx(WARNING, "write password must be 4 hex bytes if provided");
+        CLIParserFree(ctx);
+        return PM3_ESOFT;
+    }
+
+    payload.divide_ptr = (uint8_t)arg_get_int_def(ctx, 3, 0);
+    if (payload.divide_ptr > 78) {
+        PrintAndLogEx(WARNING, "protection pointer page is invalid, got " _YELLOW_("%d") " expected <= 78", payload.divide_ptr);
+        CLIParserFree(ctx);
+        return PM3_ESOFT;
+    }
+
+    int lo = arg_get_int_def(ctx, 4, 0);
+    int hi = arg_get_int_def(ctx, 5, 0);
+    CLIParserFree(ctx);
+
+    if (lo > 3 || hi > 3) {
+        PrintAndLogEx(WARNING, "page protection flags must be between 0 and 3");
+        return PM3_ESOFT;
+    }
+    payload.prot_status = (uint8_t)(hi << 4) | (uint8_t)lo;
+
+    PrintAndLogEx(INFO, "Trying to set page protection pointer to " _YELLOW_("%d"), payload.divide_ptr);
+    PrintAndLogEx(INFO, _YELLOW_("LO") " page access %s%s"
+                  , (payload.prot_status & 0x01) ? _RED_("r") : _GREEN_("r")
+                  , (payload.prot_status & 0x02) ? _RED_("w") : _GREEN_("w")
+                 );
+    PrintAndLogEx(INFO, _YELLOW_("HI") " page access %s%s"
+                  , (payload.prot_status & 0x10) ? _RED_("r") : _GREEN_("r")
+                  , (payload.prot_status & 0x20) ? _RED_("w") : _GREEN_("w"));
+
+    PacketResponseNG resp;
+    clearCommandBuffer();
+    SendCommandNG(CMD_HF_ISO15693_SLIX_PROTECT_PAGE, (uint8_t *)&payload, sizeof(payload));
+    if (WaitForResponseTimeout(CMD_HF_ISO15693_SLIX_PROTECT_PAGE, &resp, 2000) == false) {
+        PrintAndLogEx(WARNING, "Timeout while waiting for reply");
+        DropField();
+        return PM3_ESOFT;
+    }
+
+    switch (resp.status) {
+        case PM3_ETIMEOUT: {
+            PrintAndLogEx(WARNING, "No tag found");
+            break;
+        }
+        case PM3_EWRONGANSWER: {
+            PrintAndLogEx(WARNING, "Protection flags were not accepted, locked? ( " _RED_("fail") " )");
+            break;
+        }
+        case PM3_SUCCESS: {
+            PrintAndLogEx(SUCCESS, "Page protection written ( " _GREEN_("ok") " ) ");
             break;
         }
     }
@@ -3229,7 +4034,7 @@ static int CmdHF15AFIPassProtect(const char *Cmd) {
     CLIParserFree(ctx);
 
     if (pwdlen != 4) {
-        PrintAndLogEx(WARNING, "password must be 4 hex bytes");
+        PrintAndLogEx(WARNING, "Password must be 4 hex bytes");
         return PM3_ESOFT;
     }
 
@@ -3244,14 +4049,14 @@ static int CmdHF15AFIPassProtect(const char *Cmd) {
     clearCommandBuffer();
     SendCommandNG(CMD_HF_ISO15693_SLIX_PASS_PROTECT_AFI, (uint8_t *)&payload, sizeof(payload));
     if (WaitForResponseTimeout(CMD_HF_ISO15693_SLIX_PASS_PROTECT_AFI, &resp, 2000) == false) {
-        PrintAndLogEx(WARNING, "timeout while waiting for reply");
+        PrintAndLogEx(WARNING, "Timeout while waiting for reply");
         DropField();
         return PM3_ESOFT;
     }
 
     switch (resp.status) {
         case PM3_ETIMEOUT: {
-            PrintAndLogEx(WARNING, "no tag found");
+            PrintAndLogEx(WARNING, "No tag found");
             break;
         }
         case PM3_EWRONGANSWER: {
@@ -3336,7 +4141,7 @@ static int CmdHF15View(const char *Cmd) {
     CLIParserContext *ctx;
     CLIParserInit(&ctx, "hf 15 view",
                   "Print a ISO-15693 tag dump file (bin/eml/json)",
-                  "hf 15 view -f hf-iclass-AA162D30F8FF12F1-dump.bin\n"
+                  "hf 15 view -f hf-15-1122334455667788-dump.bin\n"
                  );
     void *argtable[] = {
         arg_param_begin,
@@ -3365,6 +4170,13 @@ static int CmdHF15View(const char *Cmd) {
         return PM3_EINVARG;
     }
 
+    // a .bin may hold an older struct revision, upgrade it before the checks below
+    res = convert_15_dump_format((uint8_t **)&tag, &bytes_read, true);
+    if (res != PM3_SUCCESS) {
+        free(tag);
+        return res;
+    }
+
     if (bytes_read != sizeof(iso15_tag_t)) {
         PrintAndLogEx(FAILED, "Memory image is not matching tag structure.");
         free(tag);
@@ -3375,8 +4187,11 @@ static int CmdHF15View(const char *Cmd) {
             ((tag->pagesCount * tag->bytesPerPage) > ISO15693_TAG_MAX_SIZE) ||
             (tag->pagesCount == 0) ||
             (tag->bytesPerPage == 0)) {
+
         PrintAndLogEx(FAILED, "Tag size error: pagesCount=%d, bytesPerPage=%d",
-                      tag->pagesCount, tag->bytesPerPage);
+                      tag->pagesCount,
+                      tag->bytesPerPage
+                     );
         free(tag);
         return PM3_EINVARG;
     }
@@ -3395,15 +4210,15 @@ static int CmdHF15Wipe(const char *Cmd) {
                  );
     void *argtable[6 + 3] = {0};
     uint8_t arglen = arg_add_default(argtable);
-    argtable[arglen++] = arg_int0(NULL, "bs", "<dec>", "block size (def 4)"),
-                         argtable[arglen++] = arg_lit0("v", "verbose", "verbose output");
+    argtable[arglen++] = arg_int0(NULL, "bs", "<dec>", "block size (def 4)");
+    argtable[arglen++] = arg_lit0("v", "verbose", "verbose output");
     argtable[arglen++] = arg_param_end;
     CLIExecWithReturn(ctx, Cmd, argtable, true);
 
-    uint8_t uid[HF15_UID_LENGTH];
+    uint8_t uid[ISO15693_UID_LENGTH];
     int uidlen = 0;
     CLIGetHexWithReturn(ctx, 1, uid, &uidlen);
-    bool uid_set = (uidlen == HF15_UID_LENGTH) ? true : false;
+    bool uid_set = (uidlen == ISO15693_UID_LENGTH) ? true : false;
 
     bool unaddressed = arg_get_lit(ctx, 2);
     bool scan = (arg_get_lit(ctx, 3) || (!uid_set && !unaddressed)) ? true : false; // Default fallback to scan for tag. Overriding unaddressed parameter.
@@ -3435,7 +4250,7 @@ static int CmdHF15Wipe(const char *Cmd) {
                 return PM3_EINVARG;
             }
         } else {
-            reverse_array(uid, HF15_UID_LENGTH);
+            reverse_array(uid, ISO15693_UID_LENGTH);
         }
     } else {
         PrintAndLogEx(INFO, "Using unaddressed mode");
@@ -3511,6 +4326,7 @@ static command_t CommandTable[] = {
     {"slixeasenable",       CmdHF15SlixEASEnable,     IfPm3Iso15693,   "Enable EAS mode on SLIX ISO-15693 tag"},
     {"slixprivacydisable",  CmdHF15SlixDisable,       IfPm3Iso15693,   "Disable privacy mode on SLIX ISO-15693 tag"},
     {"slixprivacyenable",   CmdHF15SlixEnable,        IfPm3Iso15693,   "Enable privacy mode on SLIX ISO-15693 tag"},
+    {"slixprotectpage",     CmdHF15SlixProtectPage,   IfPm3Iso15693,   "Protect pages on SLIX ISO-15693 tag"},
     {"passprotectafi",      CmdHF15AFIPassProtect,    IfPm3Iso15693,   "Password protect AFI - Cannot be undone"},
     {"passprotecteas",      CmdHF15EASPassProtect,    IfPm3Iso15693,   "Password protect EAS - Cannot be undone"},
     {"-----------",         CmdHF15Help,              IfPm3Iso15693,  "-------------------------- " _CYAN_("afi") " ------------------------"},
@@ -3519,6 +4335,7 @@ static command_t CommandTable[] = {
     {"writedsfid",          CmdHF15WriteDsfid,        IfPm3Iso15693,   "Writes the DSFID on an ISO-15693 tag"},
     {"-----------",         CmdHF15Help,              IfPm3Iso15693,  "------------------------- " _CYAN_("Magic") " -----------------------"},
     {"csetuid",             CmdHF15CSetUID,           IfPm3Iso15693,   "Set UID for magic card"},
+    {"cfinalize",           CmdHF15CFinalize,         IfPm3Iso15693,   "Finalize a magic V3 tag (irreversible)"},
     {NULL, NULL, NULL, NULL}
 };
 

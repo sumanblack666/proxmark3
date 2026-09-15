@@ -59,6 +59,10 @@ static int sendTry(uint8_t fmtlen, uint32_t fc, uint32_t cn, uint32_t delay, uin
     }
 
     lf_fsksim_t *payload = calloc(1, sizeof(lf_fsksim_t) + bs_len);
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
     payload->fchigh = 10;
     payload->fclow = 8;
     payload->separator = 1;
@@ -147,7 +151,7 @@ int demodAWID(bool verbose) {
     (void) verbose; // unused so far
     uint8_t *bits = calloc(MAX_GRAPH_TRACE_LEN, sizeof(uint8_t));
     if (bits == NULL) {
-        PrintAndLogEx(DEBUG, "DEBUG: Error - AWID failed to allocate memory");
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
         return PM3_EMALLOC;
     }
 
@@ -345,7 +349,7 @@ static int CmdAWIDReader(const char *Cmd) {
     do {
         lf_read(false, 12000);
         demodAWID(!cm);
-    } while (cm && !kbd_enter_pressed());
+    } while (cm && (kbd_enter_pressed() == false));
 
     return PM3_SUCCESS;
 }
@@ -403,6 +407,10 @@ static int CmdAWIDClone(const char *Cmd) {
     verify_values(&fmtlen, &fc, &cn);
 
     uint8_t *bits = calloc(96, sizeof(uint8_t));
+    if (bits == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
 
     if (getAWIDBits(fmtlen, fc, cn, bits) != PM3_SUCCESS) {
         PrintAndLogEx(ERR, "Error with tag bitstream generation.");
@@ -433,8 +441,8 @@ static int CmdAWIDClone(const char *Cmd) {
     } else {
         res = clone_t55xx_tag(blocks, ARRAYLEN(blocks));
     }
-    PrintAndLogEx(SUCCESS, "Done");
-    PrintAndLogEx(HINT, "Hint: try " _YELLOW_("`lf awid reader`") " to verify");
+    PrintAndLogEx(SUCCESS, "Done!");
+    PrintAndLogEx(HINT, "Hint: Try `" _YELLOW_("lf awid reader") "` to verify");
     return res;
 }
 
@@ -479,6 +487,10 @@ static int CmdAWIDSim(const char *Cmd) {
     // arg2 --- Inversion and clk setting
     // 96   --- Bitstream length: 96-bits == 12 bytes
     lf_fsksim_t *payload = calloc(1, sizeof(lf_fsksim_t) + sizeof(bs));
+    if (payload == NULL) {
+        PrintAndLogEx(WARNING, "Failed to allocate memory");
+        return PM3_EMALLOC;
+    }
     payload->fchigh = 10;
     payload->fclow =  8;
     payload->separator = 1;
